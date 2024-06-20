@@ -30,14 +30,15 @@ typedef int socket_t;
 #define WSACleanup()
 #endif
 
-#if __has_include("stable-diffusion.h")
-#define STABLE_DIFFUSION
+// Stable Diffusion
 // #include "preprocessing.hpp"
 #include "stable-diffusion.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_STATIC
 #include "stb_image.h"
+
+#define REPLACE(STR, FROM, TO) STR = std::regex_replace(STR, std::regex(FROM), TO);
 
 std::string join(const std::vector<std::string>& v, const std::string& delim) {
     std::string s;
@@ -56,7 +57,7 @@ std::string join(const std::vector<std::string>& v, const std::string& delim) {
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
 #define STB_IMAGE_RESIZE_STATIC
 #include "stb_image_resize.h"
-#endif
+// / Stable Diffusion
 
 #include "./bundle.h"
 
@@ -201,113 +202,115 @@ struct ServerConfig {
     std::string model;
     std::string prompt;
     std::string negative_prompt;
-    std::string cfg_scale;
-    std::string denoising_strength;
-    std::string style_ratio;
-    std::string control_strength;
-    std::string height;
-    std::string width;
-    std::string sampling_method;
-    std::string steps;
-    std::string seed;
-    std::string batch_count;
+    std::string image;  // for img2img
+    float cfg_scale;
+    float denoising_strength;
+    float style_ratio;
+    float control_strength;
+    int height;
+    int width;
+    sample_method_t sampling_method;
+    int steps;
+    int64_t seed;
+    int batch_count;
 };
 
 struct Result {
     bool ok;
+    std::string message;
     ServerConfig config;
 };
 
 void server_dump_config(ServerConfig& config) {
     std::cout << "[SERVER] **" << config.mode << " request**" << std::endl;
-    std::cout << "Model:\t" << config.model << std::endl;
-    std::cout << "Prompt:\t" << config.prompt << std::endl;
-    std::cout << "Negative Prompt:\t" << config.negative_prompt << std::endl;
-    std::cout << "CFG Scale:\t" << config.cfg_scale << std::endl;
-    std::cout << "Denoising Strength:\t" << config.denoising_strength
-              << std::endl;
-    std::cout << "Style Ratio:\t" << config.style_ratio << std::endl;
-    std::cout << "Control Strength:\t" << config.control_strength << std::endl;
-    std::cout << "Height:\t" << config.height << std::endl;
-    std::cout << "Width:\t" << config.width << std::endl;
-    std::cout << "Sampling Method:\t" << config.sampling_method << std::endl;
-    std::cout << "Steps:\t" << config.steps << std::endl;
-    std::cout << "Seed:\t" << config.seed << std::endl;
-    std::cout << "Batch Count:\t" << config.batch_count << std::endl;
+    std::cout << "model: " << config.model << std::endl;
+    std::cout << "prompt: " << config.prompt << std::endl;
+    std::cout << "negative-prompt: " << config.negative_prompt << std::endl;
+    std::cout << "cfg-scale: " << config.cfg_scale << std::endl;
+    std::cout << "denoising-strength: " << config.denoising_strength << std::endl;
+    std::cout << "style-ratio: " << config.style_ratio << std::endl;
+    std::cout << "control-strength: " << config.control_strength << std::endl;
+    std::cout << "height: " << config.height << std::endl;
+    std::cout << "width: " << config.width << std::endl;
+    std::cout << "sampling-method: " << config.sampling_method << std::endl;
+    std::cout << "steps: " << config.steps << std::endl;
+    std::cout << "seed: " << config.seed << std::endl;
 }
 
-#define SERVER_CHECK_KEY_VALUE(KeyStr, ConfigKey) \
-    if (key == KeyStr) {                          \
-        if (config.ConfigKey.length())            \
-            return {false};                       \
-        config.ConfigKey = value;                 \
+#define CHECK_REQ_ARG(KeyStr, ConfigKey, PP)                        \
+    if (key == KeyStr) {                                            \
+        if (std::find(seen.begin(), seen.end(), key) != seen.end()) \
+            return {false, "Bad Input"};                            \
+        seen.push_back(key);                                        \
+        config.ConfigKey = PP(value);                               \
     }
+
+Result parse_payload(std::string& payload, ServerConfig& config) {
+    std::istringstream iss(payload);
+    std::string token;
+
+    std::vector<std::string> seen;
+
+    while (std::getline(iss, token, '\n')) {
+        std::istringstream line(token);
+        std::string key;
+        std::string value;
+        std::getline(line, key, ' ');
+        std::getline(line, value);
+        CHECK_REQ_ARG("image", image, std::string)
+        CHECK_REQ_ARG("model", model, std::string)
+        CHECK_REQ_ARG("prompt", prompt, std::string)
+        CHECK_REQ_ARG("negative-prompt", negative_prompt, std::string)
+        CHECK_REQ_ARG("cfg-scale", cfg_scale, std::stof)
+        CHECK_REQ_ARG("style-ratio", style_ratio, std::stof)
+        CHECK_REQ_ARG("denoising-strength", denoising_strength, std::stof)  // i2i
+        CHECK_REQ_ARG("control-strength", control_strength, std::stof)
+        CHECK_REQ_ARG("height", height, std::stoi)
+        CHECK_REQ_ARG("width", width, std::stoi)
+        CHECK_REQ_ARG("steps", steps, std::stoi)
+        CHECK_REQ_ARG("seed", seed, std::stoull)
+        CHECK_REQ_ARG("batch-count", batch_count, std::stoi)
+
+        if (key == "sampling-method") {
+            config.sampling_method = EULER_A;
+            // clang-format off
+      if (value == "EULER_A") config.sampling_method = EULER_A;
+      if (value == "EULER") config.sampling_method = EULER;
+      if (value == "HEUN") config.sampling_method = HEUN;
+      if (value == "DPM2") config.sampling_method = DPM2;
+      if (value == "DPMPP2S_A") config.sampling_method = DPMPP2S_A;
+      if (value == "DPMPP2M") config.sampling_method = DPMPP2M;
+      if (value == "DPMPP2Mv2") config.sampling_method = DPMPP2Mv2;
+      if (value == "LCM") config.sampling_method = LCM;
+            // clang-format on
+        }
+    }
+
+    // replace "\n" with real newline in prompt and negative prompt
+    REPLACE(config.prompt, "\\\\n", "\n");
+    REPLACE(config.negative_prompt, "\\\\n", "\n");
+    return {true, "OK", config};
+}
 
 Result parse_txt2img(std::string payload) {
-    std::istringstream iss(payload);
-    std::string token;
-
     ServerConfig config{"txt2img"};
-
-    while (std::getline(iss, token, '\n')) {
-        std::istringstream line(token);
-        std::string key;
-        std::string value;
-        std::getline(line, key, ' ');
-        std::getline(line, value);
-        SERVER_CHECK_KEY_VALUE("model", model)
-        SERVER_CHECK_KEY_VALUE("prompt", prompt)
-        SERVER_CHECK_KEY_VALUE("negative-prompt", negative_prompt)
-        SERVER_CHECK_KEY_VALUE("cfg-scale", cfg_scale)
-        SERVER_CHECK_KEY_VALUE("style-ratio", style_ratio)
-        SERVER_CHECK_KEY_VALUE("control-strength", control_strength)
-        SERVER_CHECK_KEY_VALUE("height", height)
-        SERVER_CHECK_KEY_VALUE("width", width)
-        SERVER_CHECK_KEY_VALUE("sampling-method", sampling_method)
-        SERVER_CHECK_KEY_VALUE("steps", steps)
-        SERVER_CHECK_KEY_VALUE("seed", seed)
-        SERVER_CHECK_KEY_VALUE("batch-count", batch_count)
-    }
-
-    // replace "\n" with real newline in prompt and negative prompt
-    config.prompt = std::regex_replace(config.prompt, std::regex("\\\\n"), "\n");
-    config.negative_prompt =
-        std::regex_replace(config.negative_prompt, std::regex("\\\\n"), "\n");
-    return {true, config};
+    auto ret = parse_payload(payload, config);
+    if (!config.prompt.length())
+        return {false, "Missing prompt"};
+    return ret;
 }
+
 Result parse_img2img(std::string payload) {
-    std::istringstream iss(payload);
-    std::string token;
-
     ServerConfig config{"txt2img"};
-
-    while (std::getline(iss, token, '\n')) {
-        std::istringstream line(token);
-        std::string key;
-        std::string value;
-        std::getline(line, key, ' ');
-        std::getline(line, value);
-        SERVER_CHECK_KEY_VALUE("image", negative_prompt)
-        SERVER_CHECK_KEY_VALUE("model", model)
-        SERVER_CHECK_KEY_VALUE("prompt", prompt)
-        SERVER_CHECK_KEY_VALUE("negative-prompt", negative_prompt)
-        SERVER_CHECK_KEY_VALUE("cfg-scale", cfg_scale)
-        SERVER_CHECK_KEY_VALUE("denoising-strength", denoising_strength)
-        SERVER_CHECK_KEY_VALUE("style-ratio", style_ratio)
-        SERVER_CHECK_KEY_VALUE("control-strength", control_strength)
-        SERVER_CHECK_KEY_VALUE("height", height)
-        SERVER_CHECK_KEY_VALUE("width", width)
-        SERVER_CHECK_KEY_VALUE("sampling-method", sampling_method)
-        SERVER_CHECK_KEY_VALUE("steps", steps)
-        SERVER_CHECK_KEY_VALUE("seed", seed)
-        SERVER_CHECK_KEY_VALUE("batch-count", batch_count)
-    }
-
-    // replace "\n" with real newline in prompt and negative prompt
-    config.prompt = std::regex_replace(config.prompt, std::regex("\\\\n"), "\n");
-    return {true, config};
+    auto ret = parse_payload(payload, config);
+    if (!config.image.length())
+        return {false, "Missing image"};
+    if (!config.prompt.length())
+        return {false, "Missing prompt"};
+    return ret;
 }
-#undef SERVER_CHECK_KEY_VALUE
+
+#undef CHECK_REQ_ARG
 
 std::string server_build_response_ok(std::string payload,
                                      std::string mimeType = "text/plain") {
@@ -333,13 +336,6 @@ volatile bool isBusy = false;
 
 sd_ctx_t* sd_ctx = nullptr;
 std::string server_active_model;
-
-enum PrepareModelResult {
-    PrepareRateLimit      = -2,
-    PrepareNotFound       = -1,
-    PrepareGeneralFailure = 0,
-    PrepareOK             = 1
-};
 
 struct SDParams {
     int n_threads = -1;
@@ -392,8 +388,11 @@ struct SDParams {
 };
 
 RATE_LIMIT_CREATE(last_prepare_model_time);
-int server_prepare_model(std::string modelFileName) {
-    RATE_LIMIT_CHECK(last_prepare_model_time, -2);
+Result server_prepare_model(std::string modelFileName) {
+    RATE_LIMIT_CHECK(last_prepare_model_time, (Result{false, "Rate limited"}));
+    if (isBusy) {
+        return {false, "Server is busy"};
+    }
 
     // Check that the model exists
     const ModelDescriptor* modelDesc = nullptr;
@@ -405,11 +404,11 @@ int server_prepare_model(std::string modelFileName) {
     }
 
     if (modelDesc == nullptr) {
-        return PrepareNotFound;
+        return {false, "Model not found"};
     }
 
     if ((modelDesc->fileName == server_active_model) && sd_ctx) {
-        return PrepareOK;  // Already active
+        return {true, "Model is already set"};
     }
 
     SDParams params;
@@ -417,7 +416,7 @@ int server_prepare_model(std::string modelFileName) {
 
     bool vae_decode_only = true;
 
-    if (sd_ctx) {
+    if (sd_ctx) {  // free the old context
         free_sd_ctx(sd_ctx);
     }
 
@@ -432,93 +431,54 @@ int server_prepare_model(std::string modelFileName) {
 
     if (sd_ctx == NULL) {
         printf("[Server] new_sd_ctx_t failed\n");
-        return PrepareGeneralFailure;
+        return {false, "Failed to create new Stable Diffusion context"};
     }
 
     server_active_model = modelDesc->fileName;
 
-    return true;
+    return {true};
 }
 
 std::string raw_image_to_png_b64(int width, int height, unsigned char* data, int channels) {
-    //      int stbi_write_png_to_func(stbi_write_func *func, void *context, int w, int h, int comp, const void  *data, int stride_in_bytes);
+    //      int stbi_write_png_to_func(stbi_write_func *func, void *context, int
+    //      w, int h, int comp, const void  *data, int stride_in_bytes);
     std::vector<unsigned char> png_data;
     stbi_write_func* write_func = [](void* context, void* data, int size) {
         auto* png_data = (std::vector<unsigned char>*)context;
-        png_data->insert(png_data->end(), (unsigned char*)data, (unsigned char*)data + size);
+        png_data->insert(png_data->end(), (unsigned char*)data,
+                         (unsigned char*)data + size);
     };
-    stbi_write_png_to_func(write_func, &png_data, width, height, channels, data, width * channels);
+    stbi_write_png_to_func(write_func, &png_data, width, height, channels, data,
+                           width * channels);
     return base64_encode(std::string(png_data.begin(), png_data.end()));
 }
 
 int run_sdci_txt2img(uint64_t jobId, ServerConfig* configPtr) {
-    std::cout << "Running sdci_txt2img... jobId: " << jobId << std::endl;
+    std::cout << "[Server] Running txt2img under jobId: " << jobId << std::endl;
     isBusy               = true;
     ServerConfig& params = *configPtr;
-    if (!server_prepare_model(params.model)) {
+    if (!server_prepare_model(params.model).ok) {
         jobs[jobId].status = "ERROR";
         jobs[jobId].result = "Failed to prepare model";
         isBusy             = false;
         return 1;
     }
-    // std::string cmd = "sd.exe";
-    // cmd += " --mode txt2img";
-    // cmd += " --model " + config.model;
-    // cmd += " --prompt \"" + config.prompt + "\"";
-    // cmd += " --negative-prompt \"" + config.negative_prompt + "\"";
-    // cmd += " --cfg-scale " + config.cfg_scale;
-    // cmd += " --strength " + config.denoising_strength;
-    // cmd += " --style-ratio " + config.style_ratio;
-    // cmd += " --control-strength " + config.control_strength;
-    // cmd += " --height " + config.height;
-    // cmd += " --width " + config.width;
-    // cmd += " --sampling-method " + config.sampling_method;
-    // cmd += " --steps " + config.steps;
-    // cmd += " --seed " + config.seed;
-    // cmd += " --batch-count " + config.batch_count;
-    // std::cout << "Command: " << cmd << std::endl;
-    // std::string result = exec(cmd.c_str());
-    // std::cout << "Result: " << result << std::endl;
 
     sd_image_t* control_image = NULL;
 
-    sample_method_t samplingMethod = EULER_A;
-    if (params.sampling_method == "EULER_A")
-        samplingMethod = EULER_A;
-    if (params.sampling_method == "EULER")
-        samplingMethod = EULER;
-    if (params.sampling_method == "HEUN")
-        samplingMethod = HEUN;
-    if (params.sampling_method == "DPM2")
-        samplingMethod = DPM2;
-    if (params.sampling_method == "DPMPP2S_A")
-        samplingMethod = DPMPP2S_A;
-    if (params.sampling_method == "DPMPP2M")
-        samplingMethod = DPMPP2M;
-    if (params.sampling_method == "DPMPP2Mv2")
-        samplingMethod = DPMPP2Mv2;
-    if (params.sampling_method == "LCM")
-        samplingMethod = LCM;
+    int batch_count = params.batch_count;
 
-    int batch_count = std::stoi(params.batch_count);
+    auto results =
+        txt2img(sd_ctx, params.prompt.c_str(), params.negative_prompt.c_str(),
+                0,  // params.clip_skip
+                params.cfg_scale, params.width,
+                params.height, params.sampling_method, params.steps,
+                params.seed, batch_count, control_image,
+                params.control_strength, params.style_ratio,
+                0,  // params.normalize_input
+                ""  // params.input_id_images_path.c_str()
+        );
 
-    auto results = txt2img(sd_ctx,
-                           params.prompt.c_str(),
-                           params.negative_prompt.c_str(),
-                           0,  // params.clip_skip
-                           std::stof(params.cfg_scale),
-                           std::stoi(params.width),
-                           std::stoi(params.height),
-                           samplingMethod,
-                           std::stoi(params.steps),
-                           std::stoull(params.seed),
-                           batch_count,
-                           control_image,
-                           std::stof(params.control_strength),
-                           std::stof(params.style_ratio),
-                           0,  // params.normalize_input
-                           ""  // params.input_id_images_path.c_str()
-    );
     if (results == NULL) {
         jobs[jobId].status = "ERROR";
         jobs[jobId].result = "Generation failed";
@@ -531,48 +491,104 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig* configPtr) {
             continue;
         }
         sd_image_t current_image = results[i];
-        std::string b64          = raw_image_to_png_b64(current_image.width, current_image.height, current_image.data, current_image.channel);
+        std::string b64 =
+            raw_image_to_png_b64(current_image.width, current_image.height,
+                                 current_image.data, current_image.channel);
         outResults.push_back(b64);
     }
 
     jobs[jobId].status = "SUCCESS";
     jobs[jobId].result = outResults.size() + "\n" + join(outResults, "\n");
-    isBusy             = false;
+    free(results);
+    isBusy = false;
     return 0;
 }
 
 int run_sdci_img2img(uint64_t jobId, ServerConfig* configPtr) {
-    std::cout << "Running sdci_img2img... jobId: " << jobId << std::endl;
+    std::cout << "[Server] Running img2img under jobId: " << jobId << std::endl;
     isBusy               = true;
     ServerConfig& config = *configPtr;
-    if (!server_prepare_model(config.model)) {
+    if (!server_prepare_model(config.model).ok) {
         jobs[jobId].status = "ERROR";
         jobs[jobId].result = "Failed to prepare model";
         isBusy             = false;
         return 1;
     }
-    std::string cmd = "sd.exe";
-    cmd += " --mode img2img";
-    cmd += " --model " + config.model;
-    cmd += " --image " + config.prompt;
-    cmd += " --prompt \"" + config.prompt + "\"";
-    cmd += " --negative-prompt \"" + config.negative_prompt + "\"";
-    cmd += " --cfg-scale " + config.cfg_scale;
-    cmd += " --denoising-strength " + config.denoising_strength;
-    cmd += " --style-ratio " + config.style_ratio;
-    cmd += " --control-strength " + config.control_strength;
-    cmd += " --height " + config.height;
-    cmd += " --width " + config.width;
-    cmd += " --sampling-method " + config.sampling_method;
-    cmd += " --steps " + config.steps;
-    cmd += " --seed " + config.seed;
-    cmd += " --batch-count " + config.batch_count;
-    std::cout << "Command: " << cmd << std::endl;
-    // std::string result = exec(cmd.c_str());
-    // std::cout << "Result: " << result << std::endl;
+
+    std::string image = base64_decode(config.image);
+    int width, height, channels;
+    unsigned char* image_data =
+        stbi_load_from_memory((unsigned char*)image.c_str(), image.length(),
+                              &width, &height, &channels, 0);
+
+    if (image_data == NULL) {
+        jobs[jobId].status = "ERROR";
+        jobs[jobId].result =
+            "Failed to decode image: " + std::string(stbi_failure_reason());
+        isBusy = false;
+        return 1;
+    }
+    if ((width <= 0) || (height <= 0) || (channels < 0)) {
+        jobs[jobId].status = "ERROR";
+        jobs[jobId].result = "Invalid image dimensions";
+        stbi_image_free(image_data);
+        isBusy = false;
+        return 1;
+    }
+
+    // Resize the image to fit the desired dimensions
+    uint8_t* resized_image_buffer =
+        (uint8_t*)malloc(config.height * config.width * 3);
+    if (resized_image_buffer == NULL) {
+        fprintf(stderr, "error: allocate memory for resize input image\n");
+        stbi_image_free(image_data);
+        return 1;
+    }
+
+    stbir_resize(image_data, width, height, 0, resized_image_buffer, config.width,
+                 config.height, 0, STBIR_TYPE_UINT8, 3 /*RGB channel*/,
+                 STBIR_ALPHA_CHANNEL_NONE, 0, STBIR_EDGE_CLAMP, STBIR_EDGE_CLAMP,
+                 STBIR_FILTER_BOX, STBIR_FILTER_BOX, STBIR_COLORSPACE_SRGB,
+                 nullptr);
+
+    stbi_image_free(image_data);
+
+    sd_image_t input_image;
+    input_image.width   = width;
+    input_image.height  = height;
+    input_image.channel = channels;
+    input_image.data    = image_data;
+
+    auto results = img2img(
+        sd_ctx, input_image, config.prompt.c_str(),
+        config.negative_prompt.c_str(), 0,  // clip_skip
+        config.cfg_scale, config.width, config.height, config.sampling_method,
+        config.steps, config.denoising_strength, config.seed, config.batch_count,
+        nullptr, config.control_strength, config.style_ratio, 0,
+        "");  // normalize input, input_id_images_path
+
+    if (results == NULL) {
+        jobs[jobId].status = "ERROR";
+        jobs[jobId].result = "Generation failed";
+    }
+
+    std::vector<std::string> outResults;
+
+    for (int i = 0; i < config.batch_count; i++) {
+        if (results[i].data == NULL) {
+            continue;
+        }
+        sd_image_t current_image = results[i];
+        std::string b64 =
+            raw_image_to_png_b64(current_image.width, current_image.height,
+                                 current_image.data, current_image.channel);
+        outResults.push_back(b64);
+    }
+
     jobs[jobId].status = "SUCCESS";
-    jobs[jobId].result = "(Mock result)";
-    isBusy             = false;
+    jobs[jobId].result = outResults.size() + "\n" + join(outResults, "\n");
+    free(results);
+    isBusy = false;
     return 0;
 }
 
@@ -588,6 +604,18 @@ uint64_t server_queue_txt2img(ServerConfig config) {
     return id;
 }
 
+uint64_t server_queue_img2img(ServerConfig config) {
+    auto currentTime = std::chrono::system_clock::now();
+    auto duration    = currentTime.time_since_epoch();
+    uint64_t id =
+        std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+    jobs[id] = {id, config, "PENDING"};
+    id++;
+    std::future<int> promise =
+        std::async(std::launch::async, run_sdci_img2img, id, &config);
+    return id;
+}
+
 std::string handle_text2img(std::string payload) {
     Result result = parse_txt2img(payload);
     if (result.ok) {
@@ -595,7 +623,6 @@ std::string handle_text2img(std::string payload) {
             return server_build_response_ok("BUSY\nPlease try again later.");
         }
         uint64_t jobId = server_queue_txt2img(result.config);
-        std::cout << "Returning OK... jobId: " << jobId << "\n";
         return server_build_response_ok("OK\n" + std::to_string(jobId));
     } else {
         return server_build_response_error("Error");
@@ -608,8 +635,7 @@ std::string handle_img2img(std::string payload) {
         if (isBusy) {
             return server_build_response_ok("BUSY\nPlease try again later.");
         }
-        uint64_t jobId = server_queue_txt2img(result.config);
-        std::cout << "Returning OK... jobId: " << jobId << "\n";
+        uint64_t jobId = server_queue_img2img(result.config);
         return server_build_response_ok("OK\n" + std::to_string(jobId));
     } else {
         return server_build_response_error("Error");
@@ -630,7 +656,7 @@ void handle_client(int client_socket) {
 
     std::string request(buffer);
     // Debug
-    std::cout << "Received request:\n----\n"
+    std::cout << "Received request (" << bytes_received << " bytes):\n----\n"
               << request << "\n----" << std::endl;
 
     // Extract the HTTP method and path
@@ -667,13 +693,11 @@ void handle_client(int client_socket) {
             // replace %20 with space
             modelPath          = std::regex_replace(modelPath, std::regex("%20"), " ");
             auto prepareResult = server_prepare_model(modelPath);
-            if (prepareResult == 1) {
-                response = server_build_response_ok("OK");
-            } else if (prepareResult == -2) {
-                response = server_build_response_error(
-                    "BUSY\nRate limite exceeded. Please try again later.");
+            if (prepareResult.ok) {
+                response = server_build_response_ok("OK\n" + prepareResult.message);
             } else {
-                response = server_build_response_error("500 Internal Server Error");
+                response = server_build_response_error("500 Internal Server Error\n" +
+                                                       prepareResult.message);
             }
         } else if (path.starts_with("/api/v0/check/")) {
             std::string id_str = path.substr(14);
@@ -706,14 +730,18 @@ void handle_client(int client_socket) {
         response = server_build_response_error("405 Method Not Allowed");
     }
 
-    std::cout << "Response:\n"
-              << response << std::endl;
+    std::cout << "[Server] Sending " << response.length() << " bytes\n";
     send(client_socket, response.c_str(), response.length(), 0);
     close_socket(client_socket);
 }
 
 int server_start(int port, std::vector<std::string> files_dirs) {
     server_reload_models(files_dirs);
+    // Replace placeholders in the HTML bundle
+    REPLACE(html_bundle, "window.API_HOST", "''");
+    REPLACE(html_bundle, "window.API_PATH", "'/api/v0'");
+    REPLACE(html_bundle, "window.FILES_DIR", "'" + join(files_dirs, "*") + "'");
+
 #ifdef _WIN32
     // Initialize Winsock
     WSADATA wsaData;
