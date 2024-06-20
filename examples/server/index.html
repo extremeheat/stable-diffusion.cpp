@@ -555,15 +555,17 @@
 
     function GenerationInput({ mode }) {
       const samplingMethods = [
-        "EULER_A",
-        "EULER",
-        "HEUN",
-        "DPM2",
-        "DPMPP2S_A",
-        "DPMPP2M",
-        "DPMPP2Mv2",
-        "LCM",
-        "N_SAMPLE_METHODS",
+        ["EULER_A", "Euler Ancestral"],
+        ["EULER", "Euler"],
+        ["HEUN", "Heun"],
+        ["DPM2", "DPM2"],
+        ["DPMPP2S_A", "DPM++ (2S) Ancestral"],
+        ["DPMPP2S", "DPM++ (2S)"],
+        ["DPMPP2Sv2", "DPM++ (2S) (New)"],
+        ["DPMPP2M_A", "DPM++ (2M) Ancestral"],
+        ["DPMPP2M", "DPM++ (2M)"],
+        ["DPMPP2Mv2", "DPM++ (2M) (New)"],
+        ["LCM", "Latent Consistency Models"]
       ]
       const defaultWidth = 512
       const defaultHeight = 512
@@ -578,7 +580,7 @@
       const [samplingSteps, setSamplingSteps] = useState(20)
       const [showAdvanced, setShowAdvanced] = useState(false)
       const [autoSave, setAutoSave] = useState(true)
-      const [samplingMethod, setSamplingMethod] = useState(samplingMethods[0])
+      const [samplingMethod, setSamplingMethod] = useState(samplingMethods[0][0])
       const [upscaleRuns, setUpscaleRuns] = useState(0)
       const [controlStrength, setControlStrength] = useState(0.9)
       const [styleRatio, setStyleRatio] = useState(20)
@@ -744,7 +746,7 @@
                 </button>
               </div>
               <${Slider}
-                label="CFG Scale"
+                label="Guidance (CFG) Scale"
                 min="1"
                 max="20"
                 value=${cfgScale}
@@ -753,7 +755,7 @@
             <div class="group">
               <${Select}
                 label="Sampling method"
-                options=${samplingMethods.map((e) => ({ label: e, value: e }))}
+                options=${samplingMethods.map((e) => ({ label: e[1], value: e[0] }))}
                 value=${samplingMethod}
                 setValue=${setSamplingMethod} />
               <${Slider}
@@ -970,7 +972,7 @@
                   inside the following specified directories:
                 </h4>
                 <div class="hello-message">
-                  ${FILES_DIR.map((dir) => html`<code>${dir}</code>`)}
+                  ${FILES_DIR.map((dir) => html`<div><code>${dir}</code></div>`)}
                 </div>
               </div>`
             : html`<div class="io">

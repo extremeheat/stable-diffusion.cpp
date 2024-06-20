@@ -392,7 +392,7 @@ struct SDParams {
 };
 
 RATE_LIMIT_CREATE(last_prepare_model_time);
-Result server_prepare_model(std::string modelFileName) {
+Result server_prepare_model(std::string modelFileName, bool ignoreBusy = false) {
     // return {true, "Model is already set"};
     if ((modelFileName == server_active_model) && (sd_ctx != NULL)) {
         DEBUG_LOG("[Server] Model is already set\n");
@@ -400,7 +400,7 @@ Result server_prepare_model(std::string modelFileName) {
     }
 
     RATE_LIMIT_CHECK(last_prepare_model_time, (Result{false, "Rate limited", {}, true}));
-    if (isBusy) {
+    if (isBusy && !ignoreBusy) {
         return {false, "Server is busy", {}, true};
     }
 
@@ -468,8 +468,7 @@ std::string raw_image_to_png_b64(int width, int height, unsigned char* data, int
 int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
     std::cout << "[Server] Running txt2img, under jobId: " << jobId << std::endl;
     isBusy = true;
-    printf("[Server] Preparing...\n");
-    auto prepareResult = server_prepare_model(params.model);
+    auto prepareResult = server_prepare_model(params.model, true);
     if (!prepareResult.ok) {
         printf("[Server] Failed to prepare model '%s': %s\n", params.model.c_str(),
                prepareResult.message.c_str());
@@ -524,11 +523,10 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
     return 0;
 }
 
-int run_sdci_img2img(uint64_t jobId, ServerConfig* configPtr) {
+int run_sdci_img2img(uint64_t jobId, ServerConfig config) {
     std::cout << "[Server] Running img2img under jobId: " << jobId << std::endl;
     isBusy               = true;
-    ServerConfig& config = *configPtr;
-    auto prepareResult   = server_prepare_model(config.model);
+    auto prepareResult   = server_prepare_model(config.model, true);
     if (!prepareResult.ok) {
         jobs[jobId].status = prepareResult.wasRateLimited ? "BUSY" : "ERROR";
         jobs[jobId].result = "Failed to prepare model '" + config.model + "': " + prepareResult.message;
@@ -634,7 +632,7 @@ uint64_t server_queue_img2img(ServerConfig config) {
         std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
     jobs[id] = {id, config, "PENDING"};
     // spawn a thread to run the job
-    std::thread(run_sdci_img2img, id, &config).detach();
+    std::thread(run_sdci_img2img, id, config).detach();
     return id;
 }
 
