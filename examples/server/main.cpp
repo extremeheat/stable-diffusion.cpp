@@ -38,6 +38,9 @@ typedef int socket_t;
 #define STB_IMAGE_STATIC
 #include "stb_image.h"
 
+// #define DEBUG_LOG(...) std::cout << __VA_ARGS__ << std::endl
+#define DEBUG_LOG(...)
+
 #define REPLACE(STR, FROM, TO) STR = std::regex_replace(STR, std::regex(FROM), TO);
 
 std::string join(const std::vector<std::string>& v, const std::string& delim) {
@@ -219,6 +222,7 @@ struct Result {
     bool ok;
     std::string message;
     ServerConfig config;
+    bool wasRateLimited;
 };
 
 void server_dump_config(ServerConfig& config) {
@@ -274,14 +278,14 @@ Result parse_payload(std::string& payload, ServerConfig& config) {
         if (key == "sampling-method") {
             config.sampling_method = EULER_A;
             // clang-format off
-      if (value == "EULER_A") config.sampling_method = EULER_A;
-      if (value == "EULER") config.sampling_method = EULER;
-      if (value == "HEUN") config.sampling_method = HEUN;
-      if (value == "DPM2") config.sampling_method = DPM2;
-      if (value == "DPMPP2S_A") config.sampling_method = DPMPP2S_A;
-      if (value == "DPMPP2M") config.sampling_method = DPMPP2M;
-      if (value == "DPMPP2Mv2") config.sampling_method = DPMPP2Mv2;
-      if (value == "LCM") config.sampling_method = LCM;
+            if (value == "EULER_A") config.sampling_method = EULER_A;
+            if (value == "EULER") config.sampling_method = EULER;
+            if (value == "HEUN") config.sampling_method = HEUN;
+            if (value == "DPM2") config.sampling_method = DPM2;
+            if (value == "DPMPP2S_A") config.sampling_method = DPMPP2S_A;
+            if (value == "DPMPP2M") config.sampling_method = DPMPP2M;
+            if (value == "DPMPP2Mv2") config.sampling_method = DPMPP2Mv2;
+            if (value == "LCM") config.sampling_method = LCM;
             // clang-format on
         }
     }
@@ -389,14 +393,21 @@ struct SDParams {
 
 RATE_LIMIT_CREATE(last_prepare_model_time);
 Result server_prepare_model(std::string modelFileName) {
-    RATE_LIMIT_CHECK(last_prepare_model_time, (Result{false, "Rate limited"}));
+    // return {true, "Model is already set"};
+    if ((modelFileName == server_active_model) && (sd_ctx != NULL)) {
+        DEBUG_LOG("[Server] Model is already set\n");
+        return {true, "Model is already set"};
+    }
+
+    RATE_LIMIT_CHECK(last_prepare_model_time, (Result{false, "Rate limited", {}, true}));
     if (isBusy) {
-        return {false, "Server is busy"};
+        return {false, "Server is busy", {}, true};
     }
 
     // Check that the model exists
     const ModelDescriptor* modelDesc = nullptr;
     for (auto& model : g_server_found_models) {
+        // DEBUG_LOG("Comparing model '%s' with '%s'\n", model.fileName.c_str(), modelFileName.c_str());
         if (model.fileName == modelFileName) {
             modelDesc = &model;
             break;
@@ -404,12 +415,11 @@ Result server_prepare_model(std::string modelFileName) {
     }
 
     if (modelDesc == nullptr) {
+        printf("[Server] Model not found: %s\n", modelFileName.c_str());
         return {false, "Model not found"};
     }
 
-    if ((modelDesc->fileName == server_active_model) && sd_ctx) {
-        return {true, "Model is already set"};
-    }
+    printf("[Server] Preparing model: %s\n", modelDesc->fullPath.c_str());
 
     SDParams params;
     params.model_path = modelDesc->fullPath;
@@ -425,7 +435,7 @@ Result server_prepare_model(std::string modelFileName) {
                    params.taesd_path.c_str(), params.controlnet_path.c_str(),
                    params.lora_model_dir.c_str(), params.embeddings_path.c_str(),
                    params.stacked_id_embeddings_path.c_str(), vae_decode_only,
-                   params.vae_tiling, true, params.n_threads, params.wtype,
+                   params.vae_tiling, false, params.n_threads, params.wtype,
                    params.rng_type, params.schedule, params.clip_on_cpu,
                    params.control_net_cpu, params.vae_on_cpu);
 
@@ -433,6 +443,8 @@ Result server_prepare_model(std::string modelFileName) {
         printf("[Server] new_sd_ctx_t failed\n");
         return {false, "Failed to create new Stable Diffusion context"};
     }
+
+    printf("[Server] Model prepared: %s\n", modelDesc->fullPath.c_str());
 
     server_active_model = modelDesc->fileName;
 
@@ -453,13 +465,16 @@ std::string raw_image_to_png_b64(int width, int height, unsigned char* data, int
     return base64_encode(std::string(png_data.begin(), png_data.end()));
 }
 
-int run_sdci_txt2img(uint64_t jobId, ServerConfig* configPtr) {
-    std::cout << "[Server] Running txt2img under jobId: " << jobId << std::endl;
-    isBusy               = true;
-    ServerConfig& params = *configPtr;
-    if (!server_prepare_model(params.model).ok) {
-        jobs[jobId].status = "ERROR";
-        jobs[jobId].result = "Failed to prepare model";
+int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
+    std::cout << "[Server] Running txt2img, under jobId: " << jobId << std::endl;
+    isBusy = true;
+    printf("[Server] Preparing...\n");
+    auto prepareResult = server_prepare_model(params.model);
+    if (!prepareResult.ok) {
+        printf("[Server] Failed to prepare model '%s': %s\n", params.model.c_str(),
+               prepareResult.message.c_str());
+        jobs[jobId].status = prepareResult.wasRateLimited ? "BUSY" : "ERROR";
+        jobs[jobId].result = "Failed to prepare model '" + params.model + "': " + prepareResult.message;
         isBusy             = false;
         return 1;
     }
@@ -467,6 +482,8 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig* configPtr) {
     sd_image_t* control_image = NULL;
 
     int batch_count = params.batch_count;
+
+    printf("[Server] Running txt2img with %d batch count\n", batch_count);
 
     auto results =
         txt2img(sd_ctx, params.prompt.c_str(), params.negative_prompt.c_str(),
@@ -482,6 +499,8 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig* configPtr) {
     if (results == NULL) {
         jobs[jobId].status = "ERROR";
         jobs[jobId].result = "Generation failed";
+        isBusy             = false;
+        return 1;
     }
 
     std::vector<std::string> outResults;
@@ -495,6 +514,7 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig* configPtr) {
             raw_image_to_png_b64(current_image.width, current_image.height,
                                  current_image.data, current_image.channel);
         outResults.push_back(b64);
+        free(current_image.data);
     }
 
     jobs[jobId].status = "SUCCESS";
@@ -508,9 +528,10 @@ int run_sdci_img2img(uint64_t jobId, ServerConfig* configPtr) {
     std::cout << "[Server] Running img2img under jobId: " << jobId << std::endl;
     isBusy               = true;
     ServerConfig& config = *configPtr;
-    if (!server_prepare_model(config.model).ok) {
-        jobs[jobId].status = "ERROR";
-        jobs[jobId].result = "Failed to prepare model";
+    auto prepareResult   = server_prepare_model(config.model);
+    if (!prepareResult.ok) {
+        jobs[jobId].status = prepareResult.wasRateLimited ? "BUSY" : "ERROR";
+        jobs[jobId].result = "Failed to prepare model '" + config.model + "': " + prepareResult.message;
         isBusy             = false;
         return 1;
     }
@@ -570,6 +591,8 @@ int run_sdci_img2img(uint64_t jobId, ServerConfig* configPtr) {
     if (results == NULL) {
         jobs[jobId].status = "ERROR";
         jobs[jobId].result = "Generation failed";
+        isBusy             = false;
+        return 1;
     }
 
     std::vector<std::string> outResults;
@@ -583,6 +606,7 @@ int run_sdci_img2img(uint64_t jobId, ServerConfig* configPtr) {
             raw_image_to_png_b64(current_image.width, current_image.height,
                                  current_image.data, current_image.channel);
         outResults.push_back(b64);
+        free(current_image.data);
     }
 
     jobs[jobId].status = "SUCCESS";
@@ -598,9 +622,8 @@ uint64_t server_queue_txt2img(ServerConfig config) {
     uint64_t id =
         std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
     jobs[id] = {id, config, "PENDING"};
-    id++;
-    std::future<int> promise =
-        std::async(std::launch::async, run_sdci_txt2img, id, &config);
+    // spawn a thread to run the job
+    std::thread(run_sdci_txt2img, id, config).detach();
     return id;
 }
 
@@ -610,9 +633,8 @@ uint64_t server_queue_img2img(ServerConfig config) {
     uint64_t id =
         std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
     jobs[id] = {id, config, "PENDING"};
-    id++;
-    std::future<int> promise =
-        std::async(std::launch::async, run_sdci_img2img, id, &config);
+    // spawn a thread to run the job
+    std::thread(run_sdci_img2img, id, &config).detach();
     return id;
 }
 
@@ -646,6 +668,13 @@ void handle_client(int client_socket) {
     char buffer[BUFFER_SIZE];
     std::memset(buffer, 0, BUFFER_SIZE);
 
+    // set timeout
+    struct timeval tv;
+    tv.tv_sec  = 4;
+    tv.tv_usec = 0;
+    setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv,
+               sizeof tv);
+
     // Read the request
     int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
     if (bytes_received == SOCKET_ERROR) {
@@ -656,8 +685,8 @@ void handle_client(int client_socket) {
 
     std::string request(buffer);
     // Debug
-    std::cout << "Received request (" << bytes_received << " bytes):\n----\n"
-              << request << "\n----" << std::endl;
+    DEBUG_LOG("Received request (" << bytes_received << " bytes):\n----\n"
+                                   << request << "\n----");
 
     // Extract the HTTP method and path
     std::istringstream request_stream(request);
@@ -676,7 +705,7 @@ void handle_client(int client_socket) {
         if ((path == "/") || path.starts_with("/?")) {
             response = server_build_response_ok(html_bundle, "text/html");
         } else if (path == "/api/v0/models") {
-            std::string models;
+            std::string models = "OK\n";
             for (auto& model : g_server_found_models) {
                 models += std::to_string(model.byteSize) + " " + model.fileName + "\n";
             }
@@ -689,7 +718,7 @@ void handle_client(int client_socket) {
                     "BUSY\nRate limite exceeded. Please try again later.");
             }
         } else if (path.starts_with("/api/v0/prepare/")) {
-            std::string modelPath = path.substr(14);
+            std::string modelPath = path.substr(16);
             // replace %20 with space
             modelPath          = std::regex_replace(modelPath, std::regex("%20"), " ");
             auto prepareResult = server_prepare_model(modelPath);
@@ -701,7 +730,6 @@ void handle_client(int client_socket) {
             }
         } else if (path.starts_with("/api/v0/check/")) {
             std::string id_str = path.substr(14);
-            std::cout << "Checking job id: " << id_str << std::endl;
             uint64_t id = std::stoull(id_str);
             if (jobs.find(id) != jobs.end()) {
                 auto job = jobs[id];
@@ -715,6 +743,7 @@ void handle_client(int client_socket) {
     } else if (method == "POST") {
         std::string body = request.substr(request.find("\r\n\r\n") + 4);
         if (body.empty()) {
+            printf("[Server] No POST data received for request '%s'\n", path.c_str());
             response = server_build_response_error("400 Bad Request");
         } else {
             // std::cout << "Received POST data: [" << body << "]" << std::endl;
@@ -730,8 +759,14 @@ void handle_client(int client_socket) {
         response = server_build_response_error("405 Method Not Allowed");
     }
 
-    std::cout << "[Server] Sending " << response.length() << " bytes\n";
-    send(client_socket, response.c_str(), response.length(), 0);
+    DEBUG_LOG("Sending response (" << response.length() << " bytes):\n----\n"
+                                   << response << "\n----");
+    int sendResult = send(client_socket, response.c_str(), response.length(), 0);
+    if (sendResult == SOCKET_ERROR) {
+        std::cerr << "Failed to send response to client\n";
+    } else {
+        DEBUG_LOG("Response sent successfully: " << sendResult);
+    }
     close_socket(client_socket);
 }
 
@@ -740,7 +775,14 @@ int server_start(int port, std::vector<std::string> files_dirs) {
     // Replace placeholders in the HTML bundle
     REPLACE(html_bundle, "window.API_HOST", "''");
     REPLACE(html_bundle, "window.API_PATH", "'/api/v0'");
-    REPLACE(html_bundle, "window.FILES_DIR", "'" + join(files_dirs, "*") + "'");
+    // resolve the files_dirs
+    std::vector<std::string> resolved_dirs;
+    for (auto& dir : files_dirs) {
+        resolved_dirs.push_back(std::filesystem::absolute(dir).string());
+    }
+    std::string files_dirs_str = join(resolved_dirs, "*");
+    REPLACE(files_dirs_str, "\\\\", "/");
+    REPLACE(html_bundle, "window.FILES_DIR", "'" + files_dirs_str + "'");
 
 #ifdef _WIN32
     // Initialize Winsock
@@ -760,15 +802,17 @@ int server_start(int port, std::vector<std::string> files_dirs) {
         return 1;
     }
 
+    int finalPort = port == 0 ? DEFAULT_PORT : port;
+
     // Bind the socket to an IP / port
     sockaddr_in server_address;
     server_address.sin_family      = AF_INET;
-    server_address.sin_port        = htons(port == 0 ? DEFAULT_PORT : port);
+    server_address.sin_port        = htons(finalPort);
     server_address.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(server_socket, (struct sockaddr*)&server_address,
              sizeof(server_address)) == SOCKET_ERROR) {
-        std::cerr << "Failed to bind to port: " << socket_error() << "\n";
+        fprintf(stderr, "Failed to bind to port %d. Error %d\n", finalPort, socket_error());
         close_socket(server_socket);
         WSACleanup();
         return 1;
@@ -776,12 +820,12 @@ int server_start(int port, std::vector<std::string> files_dirs) {
 
     // Listen for connections
     if (listen(server_socket, 10) == SOCKET_ERROR) {
-        std::cerr << "Failed to listen on socket: " << socket_error() << "\n";
+        std::cerr << "Failed to listen on socket. Error " << socket_error() << "\n";
         close_socket(server_socket);
         WSACleanup();
         return 1;
     }
-    std::cout << "[Server] Server is listening on port " << port << std::endl;
+    std::cout << "[Server] Server is listening on port " << finalPort << std::endl;
 
     // Accept connections
     while (true) {
