@@ -1,12 +1,14 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <map>
 #include <regex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -53,6 +55,12 @@ std::string join(const std::vector<std::string>& v, const std::string& delim) {
     return s;
 }
 
+uint64_t current_time_since_epoch_ms() {
+    auto currentTime = std::chrono::system_clock::now();
+    auto duration    = currentTime.time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+}
+
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_STATIC
 #include "stb_image_write.h"
@@ -62,66 +70,14 @@ std::string join(const std::vector<std::string>& v, const std::string& delim) {
 #include "stb_image_resize.h"
 // / Stable Diffusion
 
+#include "./base64.h"
 #include "./bundle.h"
 
 const int DEFAULT_PORT = 8024;
 const int BUFFER_SIZE  = 4096;
 // Seconds to rate limit switching models and file system searching
-const int RATE_LIMIT = 5;
-
-inline std::string base64_encode(const std::string& data) {
-    static constexpr char kEncodingTable[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    std::string encoded;
-    encoded.reserve(((data.size() / 3) + (data.size() % 3 > 0)) * 4);
-
-    for (size_t i = 0; i < data.size(); i += 3) {
-        uint32_t octet_a = i < data.size() ? static_cast<uint8_t>(data[i]) : 0;
-        uint32_t octet_b =
-            (i + 1) < data.size() ? static_cast<uint8_t>(data[i + 1]) : 0;
-        uint32_t octet_c =
-            (i + 2) < data.size() ? static_cast<uint8_t>(data[i + 2]) : 0;
-
-        uint32_t triple = (octet_a << 0x10) + (octet_b << 0x08) + octet_c;
-
-        encoded.push_back(kEncodingTable[(triple >> 3 * 6) & 0x3F]);
-        encoded.push_back(kEncodingTable[(triple >> 2 * 6) & 0x3F]);
-        encoded.push_back(
-            i + 1 < data.size() ? kEncodingTable[(triple >> 1 * 6) & 0x3F] : '=');
-        encoded.push_back(
-            i + 2 < data.size() ? kEncodingTable[(triple >> 0 * 6) & 0x3F] : '=');
-    }
-
-    return encoded;
-}
-
-inline std::string base64_decode(const std::string& in) {
-    if (in.length() % 4 != 0)
-        return "";  // Non-base64 character
-
-    std::string out;
-    std::string chars =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::vector<int> T(256, -1);
-    for (int i = 0; i < 64; i++)
-        T[chars[i]] = i;
-
-    int val = 0, valb = -8;
-    for (unsigned char c : in) {
-        if (c == '=')
-            break;
-        if (T[c] == -1)
-            return "";  // Non-base64 character
-        val = (val << 6) + T[c];
-        valb += 6;
-        if (valb >= 0) {
-            out.push_back(char((val >> valb) & 0xFF));
-            valb -= 8;
-        }
-    }
-    return out;
-}
+const int RATE_LIMIT  = 5;
+const int JOB_TIMEOUT = 30 * 60000;  // 30 minutes
 
 struct ModelDescriptor {
     std::string fileName;
@@ -132,6 +88,8 @@ struct ModelDescriptor {
 
 std::vector<std::string> acceptedModelExtensions = {".ckpt", ".gguf", ".ggml",
                                                     ".safetensors"};
+
+static std::string output_dir = "./";
 
 std::vector<ModelDescriptor> g_server_found_models;
 
@@ -213,9 +171,15 @@ struct ServerConfig {
     int height;
     int width;
     sample_method_t sampling_method;
+    int clip_skip;
     int steps;
     int64_t seed;
     int batch_count;
+    bool auto_save = true;
+
+    uint64_t jobId     = 0;
+    uint64_t timeStart = 0;
+    uint64_t timeEnd   = 0;
 };
 
 struct Result {
@@ -225,20 +189,29 @@ struct Result {
     bool wasRateLimited;
 };
 
-void server_dump_config(ServerConfig& config) {
-    std::cout << "[SERVER] **" << config.mode << " request**" << std::endl;
-    std::cout << "model: " << config.model << std::endl;
-    std::cout << "prompt: " << config.prompt << std::endl;
-    std::cout << "negative-prompt: " << config.negative_prompt << std::endl;
-    std::cout << "cfg-scale: " << config.cfg_scale << std::endl;
-    std::cout << "denoising-strength: " << config.denoising_strength << std::endl;
-    std::cout << "style-ratio: " << config.style_ratio << std::endl;
-    std::cout << "control-strength: " << config.control_strength << std::endl;
-    std::cout << "height: " << config.height << std::endl;
-    std::cout << "width: " << config.width << std::endl;
-    std::cout << "sampling-method: " << config.sampling_method << std::endl;
-    std::cout << "steps: " << config.steps << std::endl;
-    std::cout << "seed: " << config.seed << std::endl;
+void server_dump_config(ServerConfig& config, std::ostream& to) {
+    to << "[SERVER] **" << config.mode << " request**" << std::endl;
+    to << "model: " << config.model << std::endl;
+    to << "prompt: " << config.prompt << std::endl;
+    to << "negative-prompt: " << config.negative_prompt << std::endl;
+    to << "cfg-scale: " << config.cfg_scale << std::endl;
+    to << "denoising-strength: " << config.denoising_strength << std::endl;
+    to << "style-ratio: " << config.style_ratio << std::endl;
+    to << "control-strength: " << config.control_strength << std::endl;
+    to << "height: " << config.height << std::endl;
+    to << "width: " << config.width << std::endl;
+    to << "sampling-method: " << config.sampling_method << std::endl;
+    to << "clip-skip: " << config.clip_skip << std::endl;
+    to << "steps: " << config.steps << std::endl;
+    to << "seed: " << config.seed << std::endl;
+    to << "batch-count: " << config.batch_count << std::endl;
+    to << "auto-save: " << config.auto_save << std::endl;
+}
+
+void write_auto_saved_image_metadata(std::string filename, ServerConfig& config) {
+    std::ofstream file(filename);
+    server_dump_config(config, file);
+    file.close();
 }
 
 #define CHECK_REQ_ARG(KeyStr, ConfigKey, PP)                        \
@@ -246,7 +219,11 @@ void server_dump_config(ServerConfig& config) {
         if (std::find(seen.begin(), seen.end(), key) != seen.end()) \
             return {false, "Bad Input"};                            \
         seen.push_back(key);                                        \
-        config.ConfigKey = PP(value);                               \
+        try {                                                       \
+            config.ConfigKey = PP(value);                           \
+        } catch (...) {                                             \
+            return {false, "Bad Input: " + key};                    \
+        }                                                           \
     }
 
 Result parse_payload(std::string& payload, ServerConfig& config) {
@@ -271,9 +248,11 @@ Result parse_payload(std::string& payload, ServerConfig& config) {
         CHECK_REQ_ARG("control-strength", control_strength, std::stof)
         CHECK_REQ_ARG("height", height, std::stoi)
         CHECK_REQ_ARG("width", width, std::stoi)
+        CHECK_REQ_ARG("clip-skip", clip_skip, std::stoi)
         CHECK_REQ_ARG("steps", steps, std::stoi)
         CHECK_REQ_ARG("seed", seed, std::stoull)
         CHECK_REQ_ARG("batch-count", batch_count, std::stoi)
+        CHECK_REQ_ARG("auto-save", auto_save, std::stoi)
 
         if (key == "sampling-method") {
             config.sampling_method = EULER_A;
@@ -316,17 +295,17 @@ Result parse_img2img(std::string payload) {
 
 #undef CHECK_REQ_ARG
 
-std::string server_build_response_ok(std::string payload,
-                                     std::string mimeType = "text/plain") {
-    return "HTTP/1.1 200 OK\r\nContent-Type: " + mimeType +
-           "\r\nConnection: close\r\n\r\n" + payload;
+// clang-format off
+std::string http_build_response(std::string status, std::string payload, std::string contentType = "text/plain") {
+    return "HTTP/1.1 " + status + "\r\nContent-Type: " + contentType + "\r\nConnection: close\r\n\r\n" + payload;
 }
-
-std::string server_build_response_error(std::string payload,
-                                        std::string mimeType = "text/plain") {
-    return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: " + mimeType +
-           "\r\nConnection: close\r\n\r\n" + payload;
+std::string server_build_response_ok(std::string payload, std::string mimeType = "text/plain") {
+    return http_build_response("200 OK", payload, mimeType);
 }
+std::string server_build_response_error(std::string payload, std::string mimeType = "text/plain") {
+    return http_build_response("400 Bad Request", payload, mimeType);
+}
+// clang-format on
 
 struct ServerJob {
     uint64_t id;  // timestamp
@@ -451,6 +430,27 @@ Result server_prepare_model(std::string modelFileName, bool ignoreBusy = false) 
     return {true};
 }
 
+void cleanup_old_jobs() {
+    auto currentTime = std::chrono::system_clock::now();
+    auto duration    = currentTime.time_since_epoch();
+    uint64_t currentTimeMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+    std::vector<uint64_t> oldJobs;
+    for (auto& [id, job] : jobs) {
+        if ((currentTimeMs - job.config.timeEnd) > JOB_TIMEOUT) {
+            if (job.status == "PENDING") {
+                job.status = "ERROR";
+                job.result = "Job timed out";
+                std::cout << "[Server] Job " << id << " timed out" << std::endl;
+            }
+            oldJobs.push_back(id);
+        }
+    }
+    for (auto& id : oldJobs) {
+        jobs.erase(id);
+    }
+}
+
 std::string raw_image_to_png_b64(int width, int height, unsigned char* data, int channels) {
     //      int stbi_write_png_to_func(stbi_write_func *func, void *context, int
     //      w, int h, int comp, const void  *data, int stride_in_bytes);
@@ -466,8 +466,11 @@ std::string raw_image_to_png_b64(int width, int height, unsigned char* data, int
 }
 
 int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
+    params.jobId       = jobId;
+    uint64_t timeStart = current_time_since_epoch_ms();
+    params.timeStart   = timeStart;
     std::cout << "[Server] Running txt2img, under jobId: " << jobId << std::endl;
-    isBusy = true;
+    isBusy             = true;
     auto prepareResult = server_prepare_model(params.model, true);
     if (!prepareResult.ok) {
         printf("[Server] Failed to prepare model '%s': %s\n", params.model.c_str(),
@@ -486,7 +489,7 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
 
     auto results =
         txt2img(sd_ctx, params.prompt.c_str(), params.negative_prompt.c_str(),
-                0,  // params.clip_skip
+                params.clip_skip,
                 params.cfg_scale, params.width,
                 params.height, params.sampling_method, params.steps,
                 params.seed, batch_count, control_image,
@@ -494,6 +497,9 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
                 0,  // params.normalize_input
                 ""  // params.input_id_images_path.c_str()
         );
+
+    uint64_t timeEnd = current_time_since_epoch_ms();
+    params.timeEnd   = timeEnd;
 
     if (results == NULL) {
         jobs[jobId].status = "ERROR";
@@ -512,12 +518,23 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
         std::string b64 =
             raw_image_to_png_b64(current_image.width, current_image.height,
                                  current_image.data, current_image.channel);
+        b64 += " " + std::to_string(timeEnd - timeStart);
         outResults.push_back(b64);
+
+        if (params.auto_save || true) {
+            std::string filename = output_dir + "output_" + std::to_string(timeStart) + "_" + std::to_string(i) + ".png";
+            stbi_write_png(filename.c_str(), current_image.width, current_image.height,
+                           current_image.channel, current_image.data,
+                           current_image.width * current_image.channel);
+            std::string metaFile = output_dir + "output_" + std::to_string(timeStart) + "_" + std::to_string(i) + ".txt";
+            write_auto_saved_image_metadata(metaFile, params);
+        }
+
         free(current_image.data);
     }
 
     jobs[jobId].status = "SUCCESS";
-    jobs[jobId].result = outResults.size() + "\n" + join(outResults, "\n");
+    jobs[jobId].result = std::to_string(outResults.size()) + "\n" + join(outResults, "\n");
     free(results);
     isBusy = false;
     return 0;
@@ -525,8 +542,8 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
 
 int run_sdci_img2img(uint64_t jobId, ServerConfig config) {
     std::cout << "[Server] Running img2img under jobId: " << jobId << std::endl;
-    isBusy               = true;
-    auto prepareResult   = server_prepare_model(config.model, true);
+    isBusy             = true;
+    auto prepareResult = server_prepare_model(config.model, true);
     if (!prepareResult.ok) {
         jobs[jobId].status = prepareResult.wasRateLimited ? "BUSY" : "ERROR";
         jobs[jobId].result = "Failed to prepare model '" + config.model + "': " + prepareResult.message;
@@ -580,7 +597,7 @@ int run_sdci_img2img(uint64_t jobId, ServerConfig config) {
 
     auto results = img2img(
         sd_ctx, input_image, config.prompt.c_str(),
-        config.negative_prompt.c_str(), 0,  // clip_skip
+        config.negative_prompt.c_str(), config.clip_skip,
         config.cfg_scale, config.width, config.height, config.sampling_method,
         config.steps, config.denoising_strength, config.seed, config.batch_count,
         nullptr, config.control_strength, config.style_ratio, 0,
@@ -608,35 +625,28 @@ int run_sdci_img2img(uint64_t jobId, ServerConfig config) {
     }
 
     jobs[jobId].status = "SUCCESS";
-    jobs[jobId].result = outResults.size() + "\n" + join(outResults, "\n");
+    jobs[jobId].result = std::to_string(outResults.size()) + "\n" + join(outResults, "\n");
     free(results);
     isBusy = false;
     return 0;
 }
 
 uint64_t server_queue_txt2img(ServerConfig config) {
-    auto currentTime = std::chrono::system_clock::now();
-    auto duration    = currentTime.time_since_epoch();
-    uint64_t id =
-        std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
-    jobs[id] = {id, config, "PENDING"};
-    // spawn a thread to run the job
+    uint64_t id = current_time_since_epoch_ms();
+    jobs[id]    = {id, config, "PENDING"};
     std::thread(run_sdci_txt2img, id, config).detach();
     return id;
 }
 
 uint64_t server_queue_img2img(ServerConfig config) {
-    auto currentTime = std::chrono::system_clock::now();
-    auto duration    = currentTime.time_since_epoch();
-    uint64_t id =
-        std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
-    jobs[id] = {id, config, "PENDING"};
-    // spawn a thread to run the job
+    uint64_t id = current_time_since_epoch_ms();
+    jobs[id]    = {id, config, "PENDING"};
     std::thread(run_sdci_img2img, id, config).detach();
     return id;
 }
 
 std::string handle_text2img(std::string payload) {
+    cleanup_old_jobs();
     Result result = parse_txt2img(payload);
     if (result.ok) {
         if (isBusy) {
@@ -650,6 +660,7 @@ std::string handle_text2img(std::string payload) {
 }
 
 std::string handle_img2img(std::string payload) {
+    cleanup_old_jobs();
     Result result = parse_img2img(payload);
     if (result.ok) {
         if (isBusy) {
@@ -728,7 +739,7 @@ void handle_client(int client_socket) {
             }
         } else if (path.starts_with("/api/v0/check/")) {
             std::string id_str = path.substr(14);
-            uint64_t id = std::stoull(id_str);
+            uint64_t id        = std::stoull(id_str);
             if (jobs.find(id) != jobs.end()) {
                 auto job = jobs[id];
                 response = server_build_response_ok(job.status + "\n" + job.result);
@@ -847,8 +858,8 @@ int server_start(int port, std::vector<std::string> files_dirs) {
 }
 
 void server_show_help() {
-    std::cout << "Usage: server.exe [--port PORT] [--filesDir DIR1] [--filesDir "
-                 "DIR2] ...\n";
+    std::cout << "Usage: server.exe [--port PORT]"
+                 "[--outputDir DIR] [--filesDir DIR1] [--filesDir DIR2] ...\n";
 }
 
 // accept two cli args: --port and many --filesDir's
@@ -866,6 +877,15 @@ int main(int argc, char* argv[]) {
                 searchable_dirs.push_back(argv[i + 1]);
                 i++;
             }
+        } else if (std::string(argv[i]) == "--outputDir") {
+            if (i + 1 < argc) {
+                output_dir = argv[i + 1];
+                if (!output_dir.ends_with("/") && !output_dir.ends_with("\\")) {
+                    output_dir += "/";
+                }
+                i++;
+            }
+
         } else {
             server_show_help();
             return 1;

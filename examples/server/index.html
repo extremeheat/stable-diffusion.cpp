@@ -565,7 +565,7 @@
         ["DPMPP2M_A", "DPM++ (2M) Ancestral"],
         ["DPMPP2M", "DPM++ (2M)"],
         ["DPMPP2Mv2", "DPM++ (2M) (New)"],
-        ["LCM", "Latent Consistency Models"]
+        ["LCM", "Latent Consistency Models"],
       ]
       const defaultWidth = 512
       const defaultHeight = 512
@@ -586,6 +586,7 @@
       const [styleRatio, setStyleRatio] = useState(20)
       const [cfgScale, setCfgScale] = useState(7)
       const [denoisingStrength, setDenoisingStrength] = useState(0.75)
+      const [clipSkip, setClipSkip] = useState(0)
 
       Object.assign(currentGenerationOptions, {
         mode,
@@ -599,13 +600,14 @@
         seed,
         steps: samplingSteps,
         // showAdvanced,
-        // autoSave,
+        "auto-save": Number(autoSave),
         "sampling-method": samplingMethod,
         // upscaleRuns,
         "control-strength": controlStrength,
         "style-ratio": styleRatio,
         "cfg-scale": cfgScale,
         "denoising-strength": denoisingStrength,
+        "clip-skip": clipSkip,
       })
 
       function onImageSelect(e) {
@@ -780,13 +782,26 @@
                 setValue=${setControlStrength} />
             </div>
             ${mode === "txt2img"
-              ? null
-              : html`<${Slider}
-                  label="Denoising Strength"
+              ? html`<${Slider}
+                  label="Clip Skip"
                   min="0"
-                  max="1"
-                  value=${denoisingStrength}
-                  setValue=${setDenoisingStrength} />`}
+                  max="32"
+                  value=${clipSkip}
+                  setValue=${setClipSkip} />`
+              : html`<div class="group">
+                  <${Slider}
+                    label="Clip Skip"
+                    min="0"
+                    max="32"
+                    value=${clipSkip}
+                    setValue=${setClipSkip} />
+                  <${Slider}
+                    label="Denoising Strength"
+                    min="0"
+                    max="1"
+                    value=${denoisingStrength}
+                    setValue=${setDenoisingStrength} />
+                </div>`}
           </div>
         </div>
       </div>`
@@ -961,7 +976,9 @@
           activeView=${activeView}
           setActiveView=${setActiveView} />
         <hr />
-        ${!modelStatus.model && !modelStatus.justStarted ? html`<progress id="progress-bar" aria-label="Content loading…"></progress>` : ""}
+        ${!modelStatus.model && !modelStatus.justStarted
+          ? html`<progress id="progress-bar" aria-label="Content loading…"></progress>`
+          : ""}
         <div class=${!modelStatus.model && !modelStatus.justStarted ? "disabled" : ""}>
           ${modelStatus.justStarted
             ? html`<div>
@@ -1002,8 +1019,8 @@
         </div>
         <div style="display: flex; gap: 16px">
           <div></div>
-          <div>API docs</div>
-          <div>GitHub</div>
+          <div>API doc</div>
+          <div><a href="https://github.com/extremeheat/stable-diffusion.cpp">GitHub</a></div>
         </div>
       </div>`
     }
@@ -1272,6 +1289,7 @@
               generations,
               averageGenerationTime
             )
+            const metadata = generations.shift()
             const output = { ok: true, message: "OK", images: [] }
             let seedOffset = 0
             for (const generation of generations) {
