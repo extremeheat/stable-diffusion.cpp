@@ -89,6 +89,8 @@ public:
     std::string taesd_path;
     bool use_tiny_autoencoder = false;
     bool vae_tiling           = false;
+    int vae_tiling_size       = 32;
+    float vae_tiling_overlap  = 0.5f;
     bool stacked_id           = false;
 
     std::map<std::string, struct ggml_tensor*> tensors;
@@ -1048,7 +1050,7 @@ public:
                 auto on_tiling = [&](ggml_tensor* in, ggml_tensor* out, bool init) {
                     first_stage_model->compute(n_threads, in, decode, &out);
                 };
-                sd_tiling(x, result, 8, 32, 0.5f, on_tiling);
+                sd_tiling(x, result, 8, vae_tiling_size, vae_tiling_overlap, on_tiling);
             } else {
                 first_stage_model->compute(n_threads, x, decode, &result);
             }
@@ -1175,7 +1177,10 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
                            float control_strength,
                            float style_ratio,
                            bool normalize_input,
-                           std::string input_id_images_path) {
+                           std::string input_id_images_path,
+                           // callback function taking (int batchNo, sd_image_t* image)
+                           void (*progress_cb)(void*, int, sd_image_t*) = nullptr,
+                           void* progress_cb_ctx = nullptr) {
     if (seed < 0) {
         // Generally, when using the provided command line, the seed is always >0.
         // However, to prevent potential issues if 'stable-diffusion.cpp' is invoked as a library
@@ -1327,14 +1332,12 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
     }
 
     // Sample
-    std::vector<struct ggml_tensor*> final_latents;  // collect latents to decode
     int C = 4;
     int W = width / 8;
     int H = height / 8;
-    LOG_INFO("sampling using %s method", sampling_methods_str[sample_method]);
-    for (int b = 0; b < batch_count; b++) {
+
+    auto run_samples = [&](int cur_seed, int b) {
         int64_t sampling_start = ggml_time_ms();
-        int64_t cur_seed       = seed + b;
         LOG_INFO("generating image: %i/%i - seed %" PRId64, b + 1, batch_count, cur_seed);
 
         sd_ctx->sd->rng->manual_seed(cur_seed);
@@ -1378,49 +1381,88 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
         // struct ggml_tensor* x_0 = load_tensor_from_file(ctx, "samples_ddim.bin");
         // print_ggml_tensor(x_0);
         int64_t sampling_end = ggml_time_ms();
-        LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
-        final_latents.push_back(x_0);
-    }
+        LOG_INFO("sampling completed, taking %.2fs\n", (sampling_end - sampling_start) * 1.0f / 1000);
+        return x_0;
+    };
 
-    if (sd_ctx->sd->free_params_immediately) {
-        sd_ctx->sd->diffusion_model->free_params_buffer();
-    }
-    int64_t t3 = ggml_time_ms();
-    LOG_INFO("generating %" PRId64 " latent images completed, taking %.2fs", final_latents.size(), (t3 - t1) * 1.0f / 1000);
-
-    // Decode to image
-    LOG_INFO("decoding %zu latents", final_latents.size());
-    std::vector<struct ggml_tensor*> decoded_images;  // collect decoded images
-    for (size_t i = 0; i < final_latents.size(); i++) {
-        t1                      = ggml_time_ms();
-        struct ggml_tensor* img = sd_ctx->sd->decode_first_stage(work_ctx, final_latents[i] /* x_0 */);
-        // print_ggml_tensor(img);
-        if (img != NULL) {
-            decoded_images.push_back(img);
-        }
-        int64_t t2 = ggml_time_ms();
-        LOG_INFO("latent %" PRId64 " decoded, taking %.2fs", i + 1, (t2 - t1) * 1.0f / 1000);
-    }
-
-    int64_t t4 = ggml_time_ms();
-    LOG_INFO("decode_first_stage completed, taking %.2fs", (t4 - t3) * 1.0f / 1000);
-    if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->use_tiny_autoencoder) {
-        sd_ctx->sd->first_stage_model->free_params_buffer();
-    }
     sd_image_t* result_images = (sd_image_t*)calloc(batch_count, sizeof(sd_image_t));
     if (result_images == NULL) {
         ggml_free(work_ctx);
         return NULL;
     }
 
-    for (size_t i = 0; i < decoded_images.size(); i++) {
-        result_images[i].width   = width;
-        result_images[i].height  = height;
-        result_images[i].channel = 3;
-        result_images[i].data    = sd_tensor_to_image(decoded_images[i]);
-    }
-    ggml_free(work_ctx);
+    int64_t t2;
 
+    LOG_INFO("sampling using %s method", sampling_methods_str[sample_method]);
+    if (sd_ctx->sd->free_params_immediately) {
+        // Sampling
+        std::vector<struct ggml_tensor*> final_latents;
+        int64_t sampling_start_time = ggml_time_ms();
+        for (int b = 0; b < batch_count; b++) {
+            auto final_latent = run_samples(seed + b, b);
+            final_latents.push_back(final_latent);
+        }
+        int64_t sampling_end_time = ggml_time_ms();
+        LOG_INFO("sampling completed, taking %.2fs", (sampling_end_time - sampling_start_time) * 1.0f / 1000);
+
+        sd_ctx->sd->diffusion_model->free_params_buffer();
+
+        // Decoding
+        std::vector<struct ggml_tensor*> decoded_images;  // collect decoded images
+        int b = 1;
+        for (auto latents : final_latents) {
+            t1 = ggml_time_ms();
+            struct ggml_tensor* img = sd_ctx->sd->decode_first_stage(work_ctx, latents);
+            // print_ggml_tensor(img);
+            if (img != NULL) {
+                decoded_images.push_back(img);
+            }
+            t2 = ggml_time_ms();
+            LOG_INFO("latent %" PRId64 " decoded, taking %.2fs\n", b++, (t2 - t1) * 1.0f / 1000);
+        }
+
+        if (!sd_ctx->sd->use_tiny_autoencoder) {
+            sd_ctx->sd->first_stage_model->free_params_buffer();
+        }
+
+        // Image encoding
+        int64_t t3 = ggml_time_ms();
+        for (size_t i = 0; i < decoded_images.size(); i++) {
+            result_images[i].width   = width;
+            result_images[i].height  = height;
+            result_images[i].channel = 3;
+            result_images[i].data    = sd_tensor_to_image(decoded_images[i]);
+        }
+        int64_t t4 = ggml_time_ms();
+        LOG_INFO("decode_first_stage completed, taking %.2fs", (t4 - t3) * 1.0f / 1000);
+    } else {
+        int64_t time_start_all = ggml_time_ms();
+        for (int b = 0; b < batch_count; b++) {
+            // Sampling
+            auto final_latent = run_samples(seed + b, b);
+            // Decoding
+            t1                      = ggml_time_ms();
+            struct ggml_tensor* img = sd_ctx->sd->decode_first_stage(work_ctx, final_latent);
+            t2                      = ggml_time_ms();
+            LOG_INFO("decode_first_stage completed, taking %.2fs", (t2 - t1) * 1.0f / 1000);
+
+            // Image encoding
+            t1                       = ggml_time_ms();
+            result_images[b].width   = width;
+            result_images[b].height  = height;
+            result_images[b].channel = 3;
+            result_images[b].data    = sd_tensor_to_image(img);
+            t2                       = ggml_time_ms();
+            LOG_INFO("Image encoding completed, taking %.2fs", (t2 - t1) * 1.0f / 1000);
+            if (progress_cb) {
+                progress_cb(progress_cb_ctx, b, &result_images[b]);
+            }
+        }
+        int64_t time_end_all = ggml_time_ms();
+        LOG_INFO("sampling and decoding completed for %d images, taking %.2fs", batch_count, (time_end_all - time_start_all) * 1.0f / 1000);
+    }
+
+    ggml_free(work_ctx);
     return result_images;
 }
 
@@ -1439,7 +1481,9 @@ sd_image_t* txt2img(sd_ctx_t* sd_ctx,
                     float control_strength,
                     float style_ratio,
                     bool normalize_input,
-                    const char* input_id_images_path_c_str) {
+                    const char* input_id_images_path_c_str,
+                    void (*progress_cb)(void*, int, sd_image_t*),
+                    void* progress_cb_data) {
     LOG_DEBUG("txt2img %dx%d", width, height);
     if (sd_ctx == NULL) {
         return NULL;
@@ -1483,7 +1527,9 @@ sd_image_t* txt2img(sd_ctx_t* sd_ctx,
                                                control_strength,
                                                style_ratio,
                                                normalize_input,
-                                               input_id_images_path_c_str);
+                                               input_id_images_path_c_str,
+                                               progress_cb,
+                                               progress_cb_data);
 
     size_t t1 = ggml_time_ms();
 

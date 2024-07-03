@@ -150,7 +150,9 @@ SD_API sd_image_t* txt2img(sd_ctx_t* sd_ctx,
                            float control_strength,
                            float style_strength,
                            bool normalize_input,
-                           const char* input_id_images_path);
+                           const char* input_id_images_path,
+                           void (*progress_cb)(void* ctx, int state, sd_image_t* image) = NULL,
+                           void *progress_cb_ctx = NULL);
 
 SD_API sd_image_t* img2img(sd_ctx_t* sd_ctx,
                            sd_image_t init_image,

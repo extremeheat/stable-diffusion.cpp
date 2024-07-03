@@ -94,6 +94,11 @@
         cursor: pointer;
       }
 
+      a {
+        color: #1895d3;
+        text-decoration: none;
+      }
+
       textarea {
         padding: 8px 16px;
         margin-right: 8px;
@@ -826,13 +831,23 @@
         <div class="framed">
           <div class="subtitle">Image output</div>
           ${images.map(
-            (img) =>
+            (img, i) =>
               html`<div style="margin: 8px;">
-                <img
-                  src=${img.src}
-                  alt=""
-                  style="max-width: 100%; border: 1px solid #303030; border-radius: 4px;" />
-              </div>`
+                  <img
+                    src=${img.src}
+                    alt=""
+                    style="max-width: 100%; border: 1px solid #303030; border-radius: 4px;" />
+                </div>
+                <div class="buttons gap">
+                  <button
+                    class="btn-blue"
+                    onClick=${() => {
+                      setImageAsReference(img.src)
+                    }}>
+                    Use as reference
+                  </button>
+                  <button onClick=${() => onDownloadClick(i)}>Download</button>
+                </div>`
           )}
           ${outputStatus.progress
             ? html`<div class="rainbow">${outputStatus.progress}</div>`
@@ -848,26 +863,6 @@
             : html`<p>Sorry, we couldn't generate an image right now.</p>
                 <p>Please ensure that you're using the latest version of SDUI.</p>
                 <p style="color:orange;">Server returned: ${outputStatus.message}</p>`}
-          ${images.length
-            ? html`<div class="buttons gap">
-                  <button
-                    class="btn-blue"
-                    onClick=${() => {
-                      setImageAsReference(images[0].src)
-                    }}>
-                    Use as reference
-                  </button>
-                  <!--<button>Save</button>-->
-                  <button
-                    onClick=${() => {
-                      onDownloadClick(0)
-                    }}>
-                    Download
-                  </button>
-                  <!--<button title="Delete">❌</button>-->
-                </div>
-                <p class="faded-text-button">Copy Output Folder</p> `
-            : null}
         </div>
       `
     }
@@ -1020,7 +1015,9 @@
         <div style="display: flex; gap: 16px">
           <div></div>
           <div>API doc</div>
-          <div><a href="https://github.com/extremeheat/stable-diffusion.cpp">GitHub</a></div>
+          <div>
+            <a target="_blank" href="https://github.com/extremeheat/stable-diffusion.cpp">GitHub</a>
+          </div>
         </div>
       </div>`
     }
@@ -1147,16 +1144,16 @@
       } else if (url.includes("/api/v0/prepare/")) {
         console.log("Preparing model", url.split("/").pop())
         return new Promise((resolve) =>
-          setTimeout(() => resolve({ ok: true, text: () => Promise.resolve("OK") }), 5000)
+          setTimeout(() => resolve({ ok: true, text: () => Promise.resolve("OK") }), 1000)
         )
       } else if (url.includes("/api/v0/txt2img")) {
         const job = Math.random().toString(36).substring(7)
         return Promise.resolve({
           ok: true,
           text() {
-            _generationMockResponse[job] = "PENDING\n" + job
+            _generationMockResponse[job] = "PENDING\n"
             setTimeout(async () => {
-              _generationMockResponse[job] = "SUCCESS\n" + (await getTestB64())
+              _generationMockResponse[job] = "SUCCESS\n1\n" + (await getTestB64())
               setTimeout(() => {
                 _generationMockResponse[job] = "404 Not Found"
               }, 5000)
@@ -1183,7 +1180,6 @@
     function updateAverageGenerationTime() {
       window.averageGenerationTime =
         generationTimes.reduce((a, b) => a + b, 0) / generationTimes.length
-      console.log("Average generation time now", window.averageGenerationTime)
     }
 
     let activeModel
@@ -1197,7 +1193,6 @@
       const request = IS_MOCK ? mockFetch : fetch
       async function apiCall(endpoint, postBody, statusCb) {
         try {
-          console.log("POST BODY", postBody)
           const payload = {
             method: postBody ? "POST" : "GET",
             body: postBody,
@@ -1209,7 +1204,7 @@
             e.text()
           )
           const [code, ...rest] = response.split("\n")
-          console.log("API Call Response to", endpoint, "with", postBody, code, rest)
+          // console.log("API Call Response to", endpoint, "with", postBody, code, rest)
           if (code === "BUSY") {
             statusCb?.(true, "Rate limited") // Try again after 5 seconds
             setTimeout(() => apiCall(endpoint, statusCb), RATELIMIT_RETRY_TIME)
@@ -1277,6 +1272,20 @@
         const start = Date.now()
         for (let i = 0; i < STATUS_CHECK_MAX; i++) {
           const [code, generations] = await apiCall(`/check/${id}`)
+
+          const images = []
+          if ((code === "SUCCESS" || code === "PENDING") && generations.length) {
+            const metadata = generations.shift()
+            const output = { ok: true, message: "OK", images }
+            let seedOffset = 0
+            for (const generation of generations) {
+              const [image] = generation.split(" ")
+              const src = "data:image/png;base64," + image
+              images.push({ src, generationData: data, seedOffset: seedOffset++ })
+            }
+            setOutputStatus(output)
+          }
+
           if (code === "SUCCESS") {
             const endTime = Date.now()
             const timeElapsed = endTime - start
@@ -1289,15 +1298,6 @@
               generations,
               averageGenerationTime
             )
-            const metadata = generations.shift()
-            const output = { ok: true, message: "OK", images: [] }
-            let seedOffset = 0
-            for (const generation of generations) {
-              const [image] = generation.split(" ")
-              const src = "data:image/png;base64," + image
-              output.images.push({ src, generationData: data, seedOffset: seedOffset++ })
-            }
-            setOutputStatus(output)
             break
           } else if (code === "PENDING") {
             if (averageGenerationTime) {
@@ -1311,7 +1311,12 @@
               })
             } else {
               console.log("averageGenerationTime", averageGenerationTime)
-              setOutputStatus({ ok: true, message: "Generating...", progress: "Please wait..." })
+              setOutputStatus({
+                ok: true,
+                images,
+                message: "Generating...",
+                progress: "Please wait...",
+              })
             }
           } else {
             console.log("Generation failed", code, generations)
@@ -1324,32 +1329,30 @@
 
       // prettier-ignore
       function _verifyGenerationOptions(data) {
-        if (!data.prompt) alert("Please enter a prompt to generate an image.")
-        if (data.width < 0 || data.height < 0) alert("Width and height must be positive integers.")
-        if (data["batch-size"] < 1 || data["batch-count"] < 1) alert("Batch size and count must be at least 1.")
-        if (data.seed < -1) alert("Seed must be a positive integer or -1 for random.")
-        if (data.steps < 1) alert("Sampling steps must be at least 1.")
-        if (data["control-strength"] < 0 || data["control-strength"] > 1) alert("Control strength must be between 0 and 1.")
-        if (data["style-ratio"] < 0 || data["style-ratio"] > 100) alert("Style ratio must be between 0 and 100.")
-        if (data["cfg-scale"] < 1 || data["cfg-scale"] > 20) alert("CFG scale must be between 1 and 20.")
-        if (data["denoising-strength"] < 0 || data["denoising-strength"] > 1) alert("Denoising strength must be between 0 and 1.")
-        if (data.mode === "img2img" && !data.image) alert("Please provide reference image.")
+        const raise = (msg) => { alert(msg); throw new Error(msg) }
+        if (!data.prompt) raise("Please enter a prompt to generate an image.")
+        if (data.width < 0 || data.height < 0) raise("Width and height must be positive integers.")
+        if (data["batch-size"] < 1 || data["batch-count"] < 1) raise("Batch size and count must be at least 1.")
+        if (data.seed < -1) raise("Seed must be a positive integer or -1 for random.")
+        if (data.steps < 1) raise("Sampling steps must be at least 1.")
+        if (data["control-strength"] < 0 || data["control-strength"] > 1) raise("Control strength must be between 0 and 1.")
+        if (data["style-ratio"] < 0 || data["style-ratio"] > 100) raise("Style ratio must be between 0 and 100.")
+        if (data["cfg-scale"] < 1 || data["cfg-scale"] > 20) raise("CFG scale must be between 1 and 20.")
+        if (data["denoising-strength"] < 0 || data["denoising-strength"] > 1) raise("Denoising strength must be between 0 and 1.")
+        if (data.mode === "img2img" && !data.image) raise("Please provide reference image.")
       }
 
       async function submitGenerationRequest() {
         const data = { model: modelStatus.model, ...currentGenerationOptions }
         _verifyGenerationOptions(data)
 
-        console.log("Submitting request", data)
         let reqPayload = ""
         for (const [key, value] of Object.entries(data)) {
           reqPayload += `${key} ${value}\n`
         }
-        console.log("Request payload", reqPayload)
         const response = await apiCall(`/${data.mode}`, reqPayload, (ok, message) => {
           setOutputStatus({ ok, message })
         })
-        console.log("Resp", response)
         const [code, [messageOrJobId]] = response
         if (code === "OK") {
           setOutputStatus({ ok: true, message: "Request submitted successfully" })

@@ -180,6 +180,8 @@ struct ServerConfig {
     uint64_t jobId     = 0;
     uint64_t timeStart = 0;
     uint64_t timeEnd   = 0;
+
+    std::vector<std::string> outResults;
 };
 
 struct Result {
@@ -360,7 +362,7 @@ struct SDParams {
     rng_type_t rng_type    = CUDA_RNG;
     int64_t seed           = 42;
     bool verbose           = false;
-    bool vae_tiling        = false;
+    bool vae_tiling        = true;  // save memory
     bool control_net_cpu   = false;
     bool normalize_input   = false;
     bool clip_on_cpu       = false;
@@ -465,6 +467,26 @@ std::string raw_image_to_png_b64(int width, int height, unsigned char* data, int
     return base64_encode(std::string(png_data.begin(), png_data.end()));
 }
 
+void process_txt2img_cb(void* ctx, int batchNo, sd_image_t* current_image) {
+    ServerConfig* params = (ServerConfig*)ctx;
+    std::string b64 =
+        raw_image_to_png_b64(current_image->width, current_image->height,
+                             current_image->data, current_image->channel);
+    b64 += " " + std::to_string(params->timeStart - current_time_since_epoch_ms());
+    params->outResults.push_back(b64);
+
+    if (params->auto_save) {
+        std::string filename = output_dir + "output_" + std::to_string(params->timeStart) + "_" + std::to_string(batchNo) + ".png";
+        stbi_write_png(filename.c_str(), current_image->width, current_image->height,
+                       current_image->channel, current_image->data,
+                       current_image->width * current_image->channel);
+        std::string metaFile = output_dir + "output_" + std::to_string(params->timeStart) + "_" + std::to_string(batchNo) + ".txt";
+        write_auto_saved_image_metadata(metaFile, *params);
+    }
+    free(current_image->data);
+    jobs[params->jobId].result = std::to_string(params->outResults.size()) + "\n" + join(params->outResults, "\n");
+}
+
 int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
     params.jobId       = jobId;
     uint64_t timeStart = current_time_since_epoch_ms();
@@ -494,9 +516,9 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
                 params.height, params.sampling_method, params.steps,
                 params.seed, batch_count, control_image,
                 params.control_strength, params.style_ratio,
-                0,  // params.normalize_input
-                ""  // params.input_id_images_path.c_str()
-        );
+                0,   // params.normalize_input
+                "",  // params.input_id_images_path.c_str()
+                process_txt2img_cb, (void*)&params);
 
     uint64_t timeEnd = current_time_since_epoch_ms();
     params.timeEnd   = timeEnd;
@@ -508,33 +530,8 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
         return 1;
     }
 
-    std::vector<std::string> outResults;
-
-    for (int i = 0; i < batch_count; i++) {
-        if (results[i].data == NULL) {
-            continue;
-        }
-        sd_image_t current_image = results[i];
-        std::string b64 =
-            raw_image_to_png_b64(current_image.width, current_image.height,
-                                 current_image.data, current_image.channel);
-        b64 += " " + std::to_string(timeEnd - timeStart);
-        outResults.push_back(b64);
-
-        if (params.auto_save || true) {
-            std::string filename = output_dir + "output_" + std::to_string(timeStart) + "_" + std::to_string(i) + ".png";
-            stbi_write_png(filename.c_str(), current_image.width, current_image.height,
-                           current_image.channel, current_image.data,
-                           current_image.width * current_image.channel);
-            std::string metaFile = output_dir + "output_" + std::to_string(timeStart) + "_" + std::to_string(i) + ".txt";
-            write_auto_saved_image_metadata(metaFile, params);
-        }
-
-        free(current_image.data);
-    }
-
     jobs[jobId].status = "SUCCESS";
-    jobs[jobId].result = std::to_string(outResults.size()) + "\n" + join(outResults, "\n");
+    jobs[jobId].result = std::to_string(params.outResults.size()) + "\n" + join(params.outResults, "\n");
     free(results);
     isBusy = false;
     return 0;
@@ -685,7 +682,14 @@ void handle_client(int client_socket) {
                sizeof tv);
 
     // Read the request
-    int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
+    int bytes_received = 0;
+    // Loop until we have received the entire request
+    while (true) {
+        int bytes = recv(client_socket, buffer + bytes_received, BUFFER_SIZE - 1, 0);
+        if (bytes <= 0) break;
+        bytes_received += bytes;
+    }
+
     if (bytes_received == SOCKET_ERROR) {
         std::cerr << "Failed to read from socket\n";
         close_socket(client_socket);
@@ -909,7 +913,11 @@ GET /api/v0/models/refresh
 success. Otherwise a 500 with error message as body.
 GET /api/v0/check/{id}
   - Returns the status of the job with id.
-  - Return `PENDING\n` or `SUCCESS\n{result}` on success. Result is base64
+  - Can return a status of PENDING, SUCCESS or ERROR. If PENDING, the result
+    will be the number of images generated so far plus their base64 encoded images.
+    For example if the user wants to generate 3 images and 2 are ready, the result
+    will be "PENDING\n2\n{img1}\n{img2}". If SUCCESS, the result will be the same as PENDING
+    but with all images generated. If ERROR, the result will be the error message.
 encoded image data. Otherwise a 500 with error message as body. POST
 /api/v0/txt2img
   - payload: txt2img payload. A sequence of lines with "[key] [value]" similar
