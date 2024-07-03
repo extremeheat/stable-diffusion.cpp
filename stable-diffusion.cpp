@@ -881,7 +881,7 @@ public:
 
         auto denoise = [&](ggml_tensor* input, float sigma, int step) -> ggml_tensor* {
             if (step == 1) {
-                pretty_progress(0, (int)steps, 0);
+                pretty_progress(0, (int)steps, 0, "Sampling");
             }
             int64_t t0 = ggml_time_us();
 
@@ -982,7 +982,7 @@ public:
             }
             int64_t t1 = ggml_time_us();
             if (step > 0) {
-                pretty_progress(step, (int)steps, (t1 - t0) / 1000000.f);
+                pretty_progress(step, (int)steps, (t1 - t0) / 1000000.f, "Sampling");
                 // LOG_INFO("step %d sampling completed taking %.2fs", step, (t1 - t0) * 1.0f / 1000000);
             }
             return denoised;
@@ -1177,10 +1177,7 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
                            float control_strength,
                            float style_ratio,
                            bool normalize_input,
-                           std::string input_id_images_path,
-                           // callback function taking (int batchNo, sd_image_t* image)
-                           void (*progress_cb)(void*, int, sd_image_t*) = nullptr,
-                           void* progress_cb_ctx = nullptr) {
+                           std::string input_id_images_path) {
     if (seed < 0) {
         // Generally, when using the provided command line, the seed is always >0.
         // However, to prevent potential issues if 'stable-diffusion.cpp' is invoked as a library
@@ -1454,9 +1451,7 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
             result_images[b].data    = sd_tensor_to_image(img);
             t2                       = ggml_time_ms();
             LOG_INFO("Image encoding completed, taking %.2fs", (t2 - t1) * 1.0f / 1000);
-            if (progress_cb) {
-                progress_cb(progress_cb_ctx, b, &result_images[b]);
-            }
+            batch_generation_progress(b, batch_count, &result_images[b]);
         }
         int64_t time_end_all = ggml_time_ms();
         LOG_INFO("sampling and decoding completed for %d images, taking %.2fs", batch_count, (time_end_all - time_start_all) * 1.0f / 1000);
@@ -1481,9 +1476,7 @@ sd_image_t* txt2img(sd_ctx_t* sd_ctx,
                     float control_strength,
                     float style_ratio,
                     bool normalize_input,
-                    const char* input_id_images_path_c_str,
-                    void (*progress_cb)(void*, int, sd_image_t*),
-                    void* progress_cb_data) {
+                    const char* input_id_images_path_c_str) {
     LOG_DEBUG("txt2img %dx%d", width, height);
     if (sd_ctx == NULL) {
         return NULL;
@@ -1527,9 +1520,7 @@ sd_image_t* txt2img(sd_ctx_t* sd_ctx,
                                                control_strength,
                                                style_ratio,
                                                normalize_input,
-                                               input_id_images_path_c_str,
-                                               progress_cb,
-                                               progress_cb_data);
+                                               input_id_images_path_c_str);
 
     size_t t1 = ggml_time_ms();
 

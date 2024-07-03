@@ -46,7 +46,9 @@ sd_image_f32_t clip_preprocess(sd_image_f32_t image, int size);
 
 std::string path_join(const std::string& p1, const std::string& p2);
 
-void pretty_progress(int step, int steps, float time);
+void pretty_progress(int step, int steps, float time, const char* title = 0);
+
+void batch_generation_progress(int batch, int batches, sd_image_t* data);
 
 void log_printf(sd_log_level_t level, const char* file, int line, const char* format, ...);
 

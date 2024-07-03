@@ -309,9 +309,9 @@ sd_image_t* preprocess_id_image(sd_image_t* img) {
     return resized;
 }
 
-void pretty_progress(int step, int steps, float time) {
+void pretty_progress(int step, int steps, float time, const char *title) {
     if (sd_progress_cb) {
-        sd_progress_cb(step, steps, time, sd_progress_cb_data);
+        sd_progress_cb(step, steps, time, title, sd_progress_cb_data);
         return;
     }
     if (step == 0) {
@@ -329,6 +329,7 @@ void pretty_progress(int step, int steps, float time) {
             progress += "=";
         }
     }
+    if (title) printf("%s\n", title);
     progress += "|";
     printf(time > 1.0f ? "\r%s %i/%i - %.2fs/it" : "\r%s %i/%i - %.2fit/s",
            progress.c_str(), step, steps,
@@ -389,6 +390,21 @@ void sd_set_progress_callback(sd_progress_cb_t cb, void* data) {
     sd_progress_cb      = cb;
     sd_progress_cb_data = data;
 }
+
+static sd_batch_gen_progress_cb_t sd_batch_gen_progress_cb = NULL;
+void* sd_batch_gen_progress_cb_data                        = NULL;
+
+void sd_set_batch_gen_progress_callback(sd_batch_gen_progress_cb_t cb, void* data) {
+    sd_batch_gen_progress_cb      = cb;
+    sd_batch_gen_progress_cb_data = data;
+}
+
+void batch_generation_progress(int batch, int batches, sd_image_t* data) {
+    if (sd_batch_gen_progress_cb) {
+        sd_batch_gen_progress_cb(sd_batch_gen_progress_cb_data, batch, batches, data);
+    }
+}
+
 const char* sd_get_system_info() {
     static char buffer[1024];
     std::stringstream ss;

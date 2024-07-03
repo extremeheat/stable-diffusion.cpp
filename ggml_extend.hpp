@@ -456,7 +456,7 @@ __STATIC_INLINE__ void sd_tiling(ggml_tensor* input, ggml_tensor* output, const 
     on_processing(input_tile, NULL, true);
     int num_tiles = ceil((float)input_width / non_tile_overlap) * ceil((float)input_height / non_tile_overlap);
     LOG_INFO("processing %i tiles", num_tiles);
-    pretty_progress(1, num_tiles, 0.0f);
+    pretty_progress(1, num_tiles, 0.0f, "Tiling");
     int tile_count = 1;
     bool last_y = false, last_x = false;
     float last_time = 0.0f;
@@ -476,13 +476,13 @@ __STATIC_INLINE__ void sd_tiling(ggml_tensor* input, ggml_tensor* output, const 
             ggml_merge_tensor_2d(output_tile, output, x * scale, y * scale, tile_overlap * scale);
             int64_t t2 = ggml_time_ms();
             last_time  = (t2 - t1) / 1000.0f;
-            pretty_progress(tile_count, num_tiles, last_time);
+            pretty_progress(tile_count, num_tiles, last_time, "Tiling");
             tile_count++;
         }
         last_x = false;
     }
     if (tile_count < num_tiles) {
-        pretty_progress(num_tiles, num_tiles, last_time);
+        pretty_progress(num_tiles, num_tiles, last_time, "Tiling");
     }
     ggml_free(tiles_ctx);
 }

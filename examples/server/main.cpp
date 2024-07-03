@@ -467,7 +467,7 @@ std::string raw_image_to_png_b64(int width, int height, unsigned char* data, int
     return base64_encode(std::string(png_data.begin(), png_data.end()));
 }
 
-void process_txt2img_cb(void* ctx, int batchNo, sd_image_t* current_image) {
+void process_img_cb(void* ctx, int batchNo, int batchCount, sd_image_t* current_image) {
     ServerConfig* params = (ServerConfig*)ctx;
     std::string b64 =
         raw_image_to_png_b64(current_image->width, current_image->height,
@@ -491,7 +491,7 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
     params.jobId       = jobId;
     uint64_t timeStart = current_time_since_epoch_ms();
     params.timeStart   = timeStart;
-    std::cout << "[Server] Running txt2img, under jobId: " << jobId << std::endl;
+    printf("[Server] Running txt2img under jobId: %llu with batch count\n", jobId, params.batch_count);
     isBusy             = true;
     auto prepareResult = server_prepare_model(params.model, true);
     if (!prepareResult.ok) {
@@ -505,20 +505,18 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
 
     sd_image_t* control_image = NULL;
 
-    int batch_count = params.batch_count;
-
-    printf("[Server] Running txt2img with %d batch count\n", batch_count);
+    sd_set_batch_gen_progress_callback(process_img_cb, (void*)&params);
 
     auto results =
         txt2img(sd_ctx, params.prompt.c_str(), params.negative_prompt.c_str(),
                 params.clip_skip,
                 params.cfg_scale, params.width,
                 params.height, params.sampling_method, params.steps,
-                params.seed, batch_count, control_image,
+                params.seed, params.batch_count, control_image,
                 params.control_strength, params.style_ratio,
                 0,   // params.normalize_input
-                "",  // params.input_id_images_path.c_str()
-                process_txt2img_cb, (void*)&params);
+                ""  // params.input_id_images_path.c_str()
+        );
 
     uint64_t timeEnd = current_time_since_epoch_ms();
     params.timeEnd   = timeEnd;
@@ -537,18 +535,21 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
     return 0;
 }
 
-int run_sdci_img2img(uint64_t jobId, ServerConfig config) {
-    std::cout << "[Server] Running img2img under jobId: " << jobId << std::endl;
+int run_sdci_img2img(uint64_t jobId, ServerConfig params) {
+    params.jobId       = jobId;
+    uint64_t timeStart = current_time_since_epoch_ms();
+    params.timeStart   = timeStart;
+    printf("[Server] Running img2img under jobId: %llu with batch count\n", jobId, params.batch_count);
     isBusy             = true;
-    auto prepareResult = server_prepare_model(config.model, true);
+    auto prepareResult = server_prepare_model(params.model, true);
     if (!prepareResult.ok) {
         jobs[jobId].status = prepareResult.wasRateLimited ? "BUSY" : "ERROR";
-        jobs[jobId].result = "Failed to prepare model '" + config.model + "': " + prepareResult.message;
+        jobs[jobId].result = "Failed to prepare model '" + params.model + "': " + prepareResult.message;
         isBusy             = false;
         return 1;
     }
 
-    std::string image = base64_decode(config.image);
+    std::string image = base64_decode(params.image);
     int width, height, channels;
     unsigned char* image_data =
         stbi_load_from_memory((unsigned char*)image.c_str(), image.length(),
@@ -571,15 +572,15 @@ int run_sdci_img2img(uint64_t jobId, ServerConfig config) {
 
     // Resize the image to fit the desired dimensions
     uint8_t* resized_image_buffer =
-        (uint8_t*)malloc(config.height * config.width * 3);
+        (uint8_t*)malloc(params.height * params.width * 3);
     if (resized_image_buffer == NULL) {
         fprintf(stderr, "error: allocate memory for resize input image\n");
         stbi_image_free(image_data);
         return 1;
     }
 
-    stbir_resize(image_data, width, height, 0, resized_image_buffer, config.width,
-                 config.height, 0, STBIR_TYPE_UINT8, 3 /*RGB channel*/,
+    stbir_resize(image_data, width, height, 0, resized_image_buffer, params.width,
+                 params.height, 0, STBIR_TYPE_UINT8, 3 /*RGB channel*/,
                  STBIR_ALPHA_CHANNEL_NONE, 0, STBIR_EDGE_CLAMP, STBIR_EDGE_CLAMP,
                  STBIR_FILTER_BOX, STBIR_FILTER_BOX, STBIR_COLORSPACE_SRGB,
                  nullptr);
@@ -592,12 +593,14 @@ int run_sdci_img2img(uint64_t jobId, ServerConfig config) {
     input_image.channel = channels;
     input_image.data    = image_data;
 
+    sd_set_batch_gen_progress_callback(process_img_cb, (void*)&params);
+
     auto results = img2img(
-        sd_ctx, input_image, config.prompt.c_str(),
-        config.negative_prompt.c_str(), config.clip_skip,
-        config.cfg_scale, config.width, config.height, config.sampling_method,
-        config.steps, config.denoising_strength, config.seed, config.batch_count,
-        nullptr, config.control_strength, config.style_ratio, 0,
+        sd_ctx, input_image, params.prompt.c_str(),
+        params.negative_prompt.c_str(), params.clip_skip,
+        params.cfg_scale, params.width, params.height, params.sampling_method,
+        params.steps, params.denoising_strength, params.seed, params.batch_count,
+        nullptr, params.control_strength, params.style_ratio, 0,
         "");  // normalize input, input_id_images_path
 
     if (results == NULL) {
@@ -607,22 +610,8 @@ int run_sdci_img2img(uint64_t jobId, ServerConfig config) {
         return 1;
     }
 
-    std::vector<std::string> outResults;
-
-    for (int i = 0; i < config.batch_count; i++) {
-        if (results[i].data == NULL) {
-            continue;
-        }
-        sd_image_t current_image = results[i];
-        std::string b64 =
-            raw_image_to_png_b64(current_image.width, current_image.height,
-                                 current_image.data, current_image.channel);
-        outResults.push_back(b64);
-        free(current_image.data);
-    }
-
     jobs[jobId].status = "SUCCESS";
-    jobs[jobId].result = std::to_string(outResults.size()) + "\n" + join(outResults, "\n");
+    jobs[jobId].result = std::to_string(params.outResults.size()) + "\n" + join(params.outResults, "\n");
     free(results);
     isBusy = false;
     return 0;
@@ -686,7 +675,8 @@ void handle_client(int client_socket) {
     // Loop until we have received the entire request
     while (true) {
         int bytes = recv(client_socket, buffer + bytes_received, BUFFER_SIZE - 1, 0);
-        if (bytes <= 0) break;
+        if (bytes <= 0)
+            break;
         bytes_received += bytes;
     }
 
@@ -707,7 +697,7 @@ void handle_client(int client_socket) {
     request_stream >> method >> path;
 
     if (method.empty() || path.empty()) {
-        std::cerr << "Invalid request\n";
+        DEBUG_LOG("Invalid request");
         close_socket(client_socket);
         return;
     }
