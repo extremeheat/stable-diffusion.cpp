@@ -1152,6 +1152,16 @@ sd_ctx_t* new_sd_ctx(const char* model_path_c_str,
     return sd_ctx;
 }
 
+int sd_get_model_version(sd_ctx_t* sd_ctx) {
+    return (int)sd_ctx->sd->version;
+}
+
+void sd_configure_vae_tiling(sd_ctx_t* sd_ctx, bool enabled, int tiling_size, float tiling_overlap) {
+    sd_ctx->sd->vae_tiling         = enabled;
+    sd_ctx->sd->vae_tiling_size    = tiling_size;
+    sd_ctx->sd->vae_tiling_overlap = tiling_overlap;
+}
+
 void free_sd_ctx(sd_ctx_t* sd_ctx) {
     if (sd_ctx->sd != NULL) {
         delete sd_ctx->sd;
@@ -1408,7 +1418,7 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
         std::vector<struct ggml_tensor*> decoded_images;  // collect decoded images
         int b = 1;
         for (auto latents : final_latents) {
-            t1 = ggml_time_ms();
+            t1                      = ggml_time_ms();
             struct ggml_tensor* img = sd_ctx->sd->decode_first_stage(work_ctx, latents);
             // print_ggml_tensor(img);
             if (img != NULL) {

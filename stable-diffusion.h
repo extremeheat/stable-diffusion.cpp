@@ -135,6 +135,9 @@ SD_API sd_ctx_t* new_sd_ctx(const char* model_path,
                             bool keep_control_net_cpu,
                             bool keep_vae_on_cpu);
 
+SD_API int sd_get_model_version(sd_ctx_t* sd_ctx);
+SD_API void sd_configure_vae_tiling(sd_ctx_t* sd_ctx, bool enabled, int vae_tiling_size, float vae_tiling_overlap);
+
 SD_API void free_sd_ctx(sd_ctx_t* sd_ctx);
 
 SD_API sd_image_t* txt2img(sd_ctx_t* sd_ctx,

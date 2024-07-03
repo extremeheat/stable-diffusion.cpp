@@ -420,6 +420,9 @@ Result server_prepare_model(std::string modelFileName, bool ignoreBusy = false) 
                    params.rng_type, params.schedule, params.clip_on_cpu,
                    params.control_net_cpu, params.vae_on_cpu);
 
+    sd_configure_vae_tiling(sd_ctx, params.vae_tiling, 64, 0.5f);
+    int model_version = sd_get_model_version(sd_ctx);
+
     if (sd_ctx == NULL) {
         printf("[Server] new_sd_ctx_t failed\n");
         return {false, "Failed to create new Stable Diffusion context"};
@@ -429,7 +432,7 @@ Result server_prepare_model(std::string modelFileName, bool ignoreBusy = false) 
 
     server_active_model = modelDesc->fileName;
 
-    return {true};
+    return {true, std::to_string(model_version)};
 }
 
 void cleanup_old_jobs() {
@@ -911,6 +914,9 @@ descriptor with the format "{byteSize} {fileName}"
 GET /api/v0/models/refresh
   - Refresh the list of models available on the server. Return `OK\n` on
 success. Otherwise a 500 with error message as body.
+GET /api/v0/prepare/{model}
+  - Prepare the model with the given name. Return `OK\n{modelVersion}` on success.
+    Otherwise a 500 with error message as body.
 GET /api/v0/check/{id}
   - Returns the status of the job with id.
   - Can return a status of PENDING, SUCCESS or ERROR. If PENDING, the result

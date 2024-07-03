@@ -625,6 +625,11 @@
         if (el) el.value = ""
       }
 
+      window.setGenHeightWidth = (w, h) => {
+        setWidth(w)
+        setHeight(h)
+      }
+
       return html`<div class="framed" style="min-width: 40%;">
         <div class="subtitle">${mode === "txt2img" ? "Text Input" : "Image Input"}</div>
         <div class="gen-options">
@@ -1097,6 +1102,7 @@
     const FILES_DIR = (window.FILES_DIR ?? "C:/Users/Something/someDesktop/test").split("*")
     const OUTPUTS_DIR = window.OUTPUTS_DIR ?? FILES_DIR[0]
     const IS_MOCK = API_HOST.includes("localhost")
+    const MODEL_VERSIONS = ["1", "2", "XL", "SVD"]
 
     const RATELIMIT_RETRY_TIME = 5000
     const STATUS_CHECK_MAX = 1_000 // How many seconds to wait for a job to complete before giving up
@@ -1230,6 +1236,11 @@
         if (code === "OK") {
           setModelStatus({ ok: true, model: value, message: "Model prepared successfully" })
           activeModel = value
+          const modelVersion = MODEL_VERSIONS[message]
+          if (modelVersion === "XL") {
+            // set default options for XL model (1024x1024)
+            window.setGenHeightWidth(1024, 1024)
+          }
         } else {
           setModelStatus({ ok: false, message: message })
         }
