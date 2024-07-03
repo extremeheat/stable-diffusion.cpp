@@ -247,6 +247,8 @@
         /* loading */
         .rainbow {
           display: flex;
+          white-space: pre-line;
+          text-align: center;
           justify-content: center;
           align-items: center;
           width: 512px;
@@ -404,7 +406,6 @@
         opacity: 0;
         height: 0;
         display: none;
-        /* transform: skewX(50deg) translateX(-25vw); */
       }
 
       .modal {
@@ -462,10 +463,6 @@
   </body>
 
   <script type="module">
-    // import { h, render } from "https://esm.sh/preact"
-    // import { useState, useEffect } from "https://esm.sh/preact/hooks"
-    // import htm from "https://esm.sh/htm"
-    // const html = htm.bind(h)
     import {
       render,
       html,
@@ -565,9 +562,6 @@
         ["HEUN", "Heun"],
         ["DPM2", "DPM2"],
         ["DPMPP2S_A", "DPM++ (2S) Ancestral"],
-        ["DPMPP2S", "DPM++ (2S)"],
-        ["DPMPP2Sv2", "DPM++ (2S) (New)"],
-        ["DPMPP2M_A", "DPM++ (2M) Ancestral"],
         ["DPMPP2M", "DPM++ (2M)"],
         ["DPMPP2Mv2", "DPM++ (2M) (New)"],
         ["LCM", "Latent Consistency Models"],
@@ -810,7 +804,6 @@
           </div>
         </div>
       </div>`
-      //               <${Switch} label="Don't save" value=${false} setValue=${console.log} />
     }
 
     function ImgOutput({ width, height, outputStatus, setActiveView }) {
@@ -850,7 +843,7 @@
                 </div>`
           )}
           ${outputStatus.progress
-            ? html`<div class="rainbow">${outputStatus.progress}</div>`
+            ? html`<div class="rainbow" style="margin: 8px;">${outputStatus.progress}</div>`
             : null}
           ${!outputStatus.progress && outputStatus.ok && !images.length
             ? html`<p style="margin:2vw;text-align:center;">
@@ -887,8 +880,6 @@
             <select name="model-selector" id="model-selector" onChange=${updateActiveModel}>
               <option disabled selected>Select model checkpoint</option>
               ${models.map((model) => html`<option value=${model.value}>${model.label}</option>`)}
-              <!--<option value="1">sd-v1-5-pruned-emaonly.safetensors</option>
-              <option>ponyRealism_v21VAE.safetensors</option>-->
             </select>
           </div>
           <div>
@@ -943,7 +934,6 @@
           Model Options
         </button>
       </div>`
-      //         ${isServerRunningLocally ? html`<button>Open Outputs</button>` : null}
     }
 
     function Content({
@@ -1045,17 +1035,6 @@
     }
 
     function ModelOptionsDialog({ close }) {
-      // These are the options we need to pass to the model:
-      // --vae [VAE]                        path to vae
-      // --taesd [TAESD_PATH]               path to taesd. Using Tiny AutoEncoder for fast decoding (low quality)
-      // --control-net [CONTROL_PATH]       path to control net model
-      // --embd-dir [EMBEDDING_PATH]        path to embeddings.
-      // --stacked-id-embd-dir [DIR]        path to PHOTOMAKER stacked id embeddings.
-      // --input-id-images-dir [DIR]        path to PHOTOMAKER input id images dir.
-      // --normalize-input                  normalize PHOTOMAKER input id images
-      // --upscale-model [ESRGAN_PATH]      path to esrgan model. Upscale images after generate, just RealESRGAN_x4plus_anime_6B supported by now.
-      // The ones that require paths, we can use a file picker to select the file.
-
       const dummyOpts = []
       const pickableModels = [
         { label: "Upscaler Model", tooltip: "Path to ESRGAN model", value: "esrgan" },
@@ -1276,9 +1255,16 @@
           const images = []
           if ((code === "SUCCESS" || code === "PENDING") && generations.length) {
             const metadata = generations.shift()
+            const [completedImages, step, steps, time, progressTitle] = metadata.split(" ")
             const output = { ok: true, message: "OK", images }
+            if (code === "PENDING") {
+              output.progress = progressTitle
+                ? `${progressTitle}\n\n${step} / ${steps}`
+                : "Please wait..."
+            }
             let seedOffset = 0
             for (const generation of generations) {
+              if (!generation.trim().length) continue
               const [image] = generation.split(" ")
               const src = "data:image/png;base64," + image
               images.push({ src, generationData: data, seedOffset: seedOffset++ })
@@ -1298,26 +1284,10 @@
               generations,
               averageGenerationTime
             )
+            setOutputStatus({ ok: true, images, message: "Generation completed successfully" })
             break
           } else if (code === "PENDING") {
-            if (averageGenerationTime) {
-              const now = Date.now()
-              let progress = ((now - start) / averageGenerationTime) * 100
-              if (progress >= 100) progress = 99
-              setOutputStatus({
-                ok: true,
-                message: "Generating...",
-                progress: Math.round(progress) + "%",
-              })
-            } else {
-              console.log("averageGenerationTime", averageGenerationTime)
-              setOutputStatus({
-                ok: true,
-                images,
-                message: "Generating...",
-                progress: "Please wait...",
-              })
-            }
+            // keep waiting
           } else {
             console.log("Generation failed", code, generations)
             setOutputStatus({ ok: false, message: generations })

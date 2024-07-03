@@ -487,6 +487,13 @@ void process_img_cb(void* ctx, int batchNo, int batchCount, sd_image_t* current_
     jobs[params->jobId].result = std::to_string(params->outResults.size()) + "\n" + join(params->outResults, "\n");
 }
 
+void process_progress_cb(int step, int steps, float time, const char* title, void *ctx) {
+    ServerConfig* params = (ServerConfig*)ctx;
+    std::string metadata = std::to_string(params->outResults.size());
+    metadata += " " + std::to_string(step) + " " + std::to_string(steps) + " " + std::to_string(time) + " " + title;
+    jobs[params->jobId].result = metadata + " " +  + "\n" + join(params->outResults, "\n");    
+}
+
 int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
     params.jobId       = jobId;
     uint64_t timeStart = current_time_since_epoch_ms();
@@ -505,7 +512,9 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
 
     sd_image_t* control_image = NULL;
 
+    sd_set_progress_callback(process_progress_cb, (void*)&params);
     sd_set_batch_gen_progress_callback(process_img_cb, (void*)&params);
+
 
     auto results =
         txt2img(sd_ctx, params.prompt.c_str(), params.negative_prompt.c_str(),
@@ -593,6 +602,7 @@ int run_sdci_img2img(uint64_t jobId, ServerConfig params) {
     input_image.channel = channels;
     input_image.data    = image_data;
 
+    sd_set_progress_callback(process_progress_cb, (void*)&params);
     sd_set_batch_gen_progress_callback(process_img_cb, (void*)&params);
 
     auto results = img2img(

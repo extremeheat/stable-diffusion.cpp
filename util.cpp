@@ -318,6 +318,7 @@ void pretty_progress(int step, int steps, float time, const char *title) {
         return;
     }
     std::string progress = "  |";
+    if (title != NULL) progress = std::string(title) + progress;
     int max_progress     = 50;
     int32_t current      = (int32_t)(step * 1.f * max_progress / steps);
     for (int i = 0; i < 50; i++) {
@@ -329,7 +330,6 @@ void pretty_progress(int step, int steps, float time, const char *title) {
             progress += "=";
         }
     }
-    if (title) printf("%s\n", title);
     progress += "|";
     printf(time > 1.0f ? "\r%s %i/%i - %.2fs/it" : "\r%s %i/%i - %.2fit/s",
            progress.c_str(), step, steps,
