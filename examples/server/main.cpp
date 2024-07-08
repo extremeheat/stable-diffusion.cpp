@@ -271,6 +271,12 @@ Result parse_payload(std::string& payload, ServerConfig& config) {
         }
     }
 
+    // Ensure width and height are valid and multiples of 2
+    if ((config.width < 16) || (config.height < 16) || (config.width % 2) ||
+        (config.height % 2)) {
+        return {false, "Invalid width or height: must be valid power of 2 greater than 16"};
+    }
+
     // replace "\n" with real newline in prompt and negative prompt
     REPLACE(config.prompt, "\\\\n", "\n");
     REPLACE(config.negative_prompt, "\\\\n", "\n");
@@ -365,7 +371,7 @@ struct SDParams {
     bool vae_tiling        = true;  // save memory
     bool control_net_cpu   = false;
     bool normalize_input   = false;
-    bool clip_on_cpu       = false;
+    bool clip_on_cpu       = false;  // save memory
     bool vae_on_cpu        = false;
     bool canny_preprocess  = false;
     bool color             = false;
@@ -411,6 +417,8 @@ Result server_prepare_model(std::string modelFileName, bool ignoreBusy = false) 
         free_sd_ctx(sd_ctx);
     }
 
+    params.n_threads = get_num_physical_cores();
+
     sd_ctx =
         new_sd_ctx(params.model_path.c_str(), params.vae_path.c_str(),
                    params.taesd_path.c_str(), params.controlnet_path.c_str(),
@@ -420,7 +428,7 @@ Result server_prepare_model(std::string modelFileName, bool ignoreBusy = false) 
                    params.rng_type, params.schedule, params.clip_on_cpu,
                    params.control_net_cpu, params.vae_on_cpu);
 
-    sd_configure_vae_tiling(sd_ctx, params.vae_tiling, 64, 0.5f);
+    sd_configure_vae_tiling(sd_ctx, true, 64, 0.5f);
     int model_version = sd_get_model_version(sd_ctx);
 
     if (sd_ctx == NULL) {
@@ -490,11 +498,11 @@ void process_img_cb(void* ctx, int batchNo, int batchCount, sd_image_t* current_
     jobs[params->jobId].result = std::to_string(params->outResults.size()) + "\n" + join(params->outResults, "\n");
 }
 
-void process_progress_cb(int step, int steps, float time, const char* title, void *ctx) {
+void process_progress_cb(int step, int steps, float time, const char* title, void* ctx) {
     ServerConfig* params = (ServerConfig*)ctx;
     std::string metadata = std::to_string(params->outResults.size());
-    metadata += " " + std::to_string(step) + " " + std::to_string(steps) + " " + std::to_string(time) + " " + title;
-    jobs[params->jobId].result = metadata + " " +  + "\n" + join(params->outResults, "\n");    
+    metadata += " " + std::to_string(step) + " " + std::to_string(steps) + " " + std::to_string(time) + " " + (title ? title : "");
+    jobs[params->jobId].result = metadata + " " + "\n" + join(params->outResults, "\n");
 }
 
 int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
@@ -518,7 +526,6 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
     sd_set_progress_callback(process_progress_cb, (void*)&params);
     sd_set_batch_gen_progress_callback(process_img_cb, (void*)&params);
 
-
     auto results =
         txt2img(sd_ctx, params.prompt.c_str(), params.negative_prompt.c_str(),
                 params.clip_skip,
@@ -526,7 +533,7 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
                 params.height, params.sampling_method, params.steps,
                 params.seed, params.batch_count, control_image,
                 params.control_strength, params.style_ratio,
-                0,   // params.normalize_input
+                0,  // params.normalize_input
                 ""  // params.input_id_images_path.c_str()
         );
 

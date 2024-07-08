@@ -1176,7 +1176,7 @@
       const [outputStatus, setOutputStatus] = useState({ ok: true, message: "" })
 
       const request = IS_MOCK ? mockFetch : fetch
-      async function apiCall(endpoint, postBody, statusCb) {
+      async function apiCall(endpoint, postBody, statusCb, noRetry) {
         try {
           const payload = {
             method: postBody ? "POST" : "GET",
@@ -1192,12 +1192,18 @@
           // console.log("API Call Response to", endpoint, "with", postBody, code, rest)
           if (code === "BUSY") {
             statusCb?.(true, "Rate limited") // Try again after 5 seconds
-            setTimeout(() => apiCall(endpoint, statusCb), RATELIMIT_RETRY_TIME)
+            await sleep(RATELIMIT_RETRY_TIME)
+            return apiCall(endpoint, postBody, statusCb)
           }
           return [code, rest]
         } catch (e) {
           console.error(e)
-          alert("Network error. Please check your connection and try again.")
+          if (noRetry) {
+            alert("Network error. Please check your connection and try again.")
+          } else {
+            await sleep(RATELIMIT_RETRY_TIME)
+            return apiCall(endpoint, postBody, statusCb, true)
+          }
         }
       }
 

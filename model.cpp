@@ -1503,12 +1503,26 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, ggml_backend
 
 bool ModelLoader::load_tensors(std::map<std::string, struct ggml_tensor*>& tensors,
                                ggml_backend_t backend,
-                               std::set<std::string> ignore_tensors) {
+                               std::set<std::string> ignore_tensors,
+                               std::set<std::string> only_tensors) {
     std::set<std::string> tensor_names_in_file;
     auto on_new_tensor_cb = [&](const TensorStorage& tensor_storage, ggml_tensor** dst_tensor) -> bool {
         const std::string& name = tensor_storage.name;
-        // LOG_DEBUG("%s", tensor_storage.to_string().c_str());
+        // LOG_DEBUG("%s (size %d)", tensor_storage.to_string().c_str(), tensor_storage.name.c_str(), tensor_storage.nbytes_to_read());
         tensor_names_in_file.insert(name);
+
+        if (only_tensors.size() > 0) {
+            bool found = false; // Check if tensor starts with any of the only_tensors
+            for (auto& only_tensor : only_tensors) {
+                if (starts_with(name, only_tensor)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return true;
+            }
+        }
 
         struct ggml_tensor* real;
         if (tensors.find(name) != tensors.end()) {

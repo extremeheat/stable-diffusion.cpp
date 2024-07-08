@@ -65,6 +65,11 @@ __STATIC_INLINE__ void ggml_tensor_set_f32(struct ggml_tensor* tensor, float val
     *(float*)((char*)(tensor->data) + i * tensor->nb[3] + j * tensor->nb[2] + k * tensor->nb[1] + l * tensor->nb[0]) = value;
 }
 
+__STATIC_INLINE__ void ggml_tensor_set_f16(struct ggml_tensor* tensor, ggml_fp16_t value, int l, int k = 0, int j = 0, int i = 0) {
+    GGML_ASSERT(tensor->nb[0] == sizeof(ggml_fp16_t));
+    *(ggml_fp16_t*)((char*)(tensor->data) + i * tensor->nb[3] + j * tensor->nb[2] + k * tensor->nb[1] + l * tensor->nb[0]) = value;
+}
+
 __STATIC_INLINE__ float ggml_tensor_get_f32(const ggml_tensor* tensor, int l, int k = 0, int j = 0, int i = 0) {
     if (tensor->buffer != NULL) {
         float value;
@@ -333,6 +338,34 @@ __STATIC_INLINE__ void ggml_split_tensor_2d(struct ggml_tensor* input,
     }
 }
 
+__STATIC_INLINE__ void ggml_split_tensor_2d(struct ggml_tensor* input,
+                                            struct ggml_tensor* output,
+                                            int sX,
+                                            int sY,
+                                            int dX,
+                                            int dY,
+                                            int height,
+                                            int width) {
+    int64_t channels = output->ne[2];
+    for (int iy = 0; iy < height; iy++) {
+        for (int ix = 0; ix < width; ix++) {
+            for (int k = 0; k < channels; k++) {
+                float value;
+                if (input->type == GGML_TYPE_F32) {
+                    value = ggml_tensor_get_f32(input, ix + sX, iy + sY, k);
+                } else if (input->type == GGML_TYPE_F16) {
+                    value = ggml_tensor_get_f16(input, ix + sX, iy + sY, k);
+                }
+                if (output->type == GGML_TYPE_F32) {
+                    ggml_tensor_set_f32(output, value, ix + dX, iy + dY, k);
+                } else if (output->type == GGML_TYPE_F16) {
+                    ggml_tensor_set_f16(output, (ggml_fp16_t)value, ix + dX, iy + dY, k);
+                }
+            }
+        }
+    }
+}
+
 __STATIC_INLINE__ void ggml_merge_tensor_2d(struct ggml_tensor* input,
                                             struct ggml_tensor* output,
                                             int x,
@@ -484,6 +517,119 @@ __STATIC_INLINE__ void sd_tiling(ggml_tensor* input, ggml_tensor* output, const 
     if (tile_count < num_tiles) {
         pretty_progress(num_tiles, num_tiles, last_time, "Tiling");
     }
+    ggml_free(tiles_ctx);
+}
+
+__STATIC_INLINE__ void sd_tiling4(ggml_tensor* input, ggml_tensor* output, on_tile_process on_processing) {
+    int input_width   = (int)input->ne[0];
+    int input_height  = (int)input->ne[1];
+    int output_width  = (int)output->ne[0];
+    int output_height = (int)output->ne[1];
+
+    GGML_ASSERT(input_width % 2 == 0 && input_height % 2 == 0 && output_width % 2 == 0 && output_height % 2 == 0);  // should be multiple of 2
+    GGML_ASSERT(input_width >= 16 && input_height >= 16);
+
+    int output_min_dim     = output_width > output_height ? output_height : output_width;
+    const int BLEND_PIXELS = 20;
+    const int scale        = 8;
+    int tile_size          = ceil(output_min_dim / 16) + BLEND_PIXELS;
+
+    // printf("input: %d x %d, output: %d x %d\n", input_width, input_height, output_width, output_height);
+
+    struct ggml_init_params params = {};
+    params.mem_size += tile_size * tile_size * input->ne[2] * sizeof(float);                       // input chunk
+    params.mem_size += (tile_size * scale) * (tile_size * scale) * output->ne[2] * sizeof(float);  // output chunk
+    params.mem_size += 3 * ggml_tensor_overhead();
+    params.mem_buffer = NULL;
+    params.no_alloc   = false;
+    LOG_DEBUG("tile work buffer size: %.2f MB", params.mem_size / 1024.f / 1024.f);
+
+    // draft context
+    struct ggml_context* tiles_ctx = ggml_init(params);
+    if (!tiles_ctx) {
+        LOG_ERROR("ggml_init() failed");
+        return;
+    }
+
+    // tiling
+    ggml_tensor* input_tile  = ggml_new_tensor_4d(tiles_ctx, GGML_TYPE_F32, tile_size, tile_size, input->ne[2], 1);
+    ggml_tensor* output_tile = ggml_new_tensor_4d(tiles_ctx, GGML_TYPE_F32, tile_size * scale, tile_size * scale, output->ne[2], 1);
+    on_processing(input_tile, NULL, true);
+
+    int num_tiles_x = ceil((float)input_width / tile_size);
+    int num_tiles_y = ceil((float)input_height / tile_size);
+    int num_tiles   = num_tiles_x * num_tiles_y;
+
+    LOG_INFO("processing %i tiles", num_tiles);
+    pretty_progress(1, num_tiles, 0.0f, "Tiling");
+
+    int tile_count  = 1;
+    float last_time = 0.0f;
+
+    for (int ty = 0; ty < num_tiles_y; ty++) {
+        for (int tx = 0; tx < num_tiles_x; tx++) {
+            int xBase = tx * tile_size;
+            int yBase = ty * tile_size;
+            int xEnd  = xBase * scale;
+            int yEnd  = yBase * scale;
+
+            int x = xBase;
+            int y = yBase;
+
+            int inp_x_off  = 0;
+            int inp_y_off  = 0;
+            int out_x_off  = 0;
+            int out_y_off  = 0;
+            int out_width  = output_tile->ne[0];
+            int out_height = output_tile->ne[1];
+            // Remove sharp edges by blending with the previous tile just a bit
+            int safe_padding = BLEND_PIXELS;
+
+            if (x + tile_size >= input_width) {
+                out_width = output_width - xEnd;
+                int newX  = input_width - tile_size;
+                inp_x_off = (x - newX) * scale;
+                x         = newX;
+                if ((inp_x_off - safe_padding) > 0) {
+                    inp_x_off -= safe_padding;
+                    out_x_off = -safe_padding;
+                    out_width += safe_padding;
+                }
+            }
+            if (y + tile_size >= input_height) {
+                out_height = output_height - yEnd;
+                int newY   = input_height - tile_size;
+                inp_y_off  = (y - newY) * scale;
+                y          = newY;
+                if ((inp_y_off - safe_padding) > 0) {
+                    inp_y_off -= safe_padding;
+                    out_y_off = -safe_padding;
+                    out_height += safe_padding;
+                }
+            }
+            // printf("x=%d, y=%d (ty=%d, tx=%d) (OW=%d, OH=%d)\n", x, y, ty, tx, out_width, out_height);
+            // printf("xOffset=%d, yOffset=%d\n", inp_x_off, inp_y_off);
+
+            int64_t t1 = ggml_time_ms();
+
+            ggml_split_tensor_2d(input, input_tile, x, y);
+            on_processing(input_tile, output_tile, false);
+            ggml_split_tensor_2d(output_tile, output,
+                                 inp_x_off, inp_y_off,
+                                 xEnd + out_x_off, yEnd + out_y_off,
+                                 out_height, out_width);
+            int64_t t2 = ggml_time_ms();
+            last_time  = (t2 - t1) / 1000.0f;
+
+            pretty_progress(tile_count, num_tiles, last_time, "Tiling");
+            tile_count++;
+        }
+    }
+
+    if (tile_count <= num_tiles) {
+        pretty_progress(num_tiles, num_tiles, last_time);
+    }
+
     ggml_free(tiles_ctx);
 }
 
@@ -765,7 +911,7 @@ __STATIC_INLINE__ size_t ggml_tensor_num(ggml_context* ctx) {
 #define MAX_GRAPH_SIZE 15360
 
 struct GGMLModule {
-protected:
+public:
     typedef std::function<struct ggml_cgraph*()> get_graph_cb_t;
 
     struct ggml_context* params_ctx     = NULL;
@@ -878,10 +1024,10 @@ public:
         }
         size_t params_buffer_size = ggml_backend_buffer_get_size(params_buffer);
         LOG_DEBUG("%s params backend buffer size = % 6.2f MB(%s) (%i tensors)",
-                  get_desc().c_str(),
-                  params_buffer_size / (1024.0 * 1024.0),
-                  ggml_backend_is_cpu(backend) ? "RAM" : "VRAM",
-                  num_tensors);
+               get_desc().c_str(),
+               params_buffer_size / (1024.0 * 1024.0),
+               ggml_backend_is_cpu(backend) ? "RAM" : "VRAM",
+               num_tensors);
         return true;
     }
 

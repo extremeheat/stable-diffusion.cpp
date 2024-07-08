@@ -73,6 +73,8 @@ public:
     bool vae_decode_only         = false;
     bool free_params_immediately = false;
 
+    ModelLoader model_loader;
+
     std::shared_ptr<RNG> rng = std::make_shared<STDDefaultRNG>();
     int n_threads            = -1;
     float scale_factor       = 0.18215f;
@@ -163,13 +165,12 @@ public:
         }
 #ifdef SD_USE_FLASH_ATTENTION
 #if defined(SD_USE_CUBLAS) || defined(SD_USE_METAL)
-        LOG_WARN("Flash Attention not supported with GPU Backend");
+        printf("Flash Attention not supported with GPU Backend");
 #else
-        LOG_INFO("Flash Attention enabled");
+        printf("Flash Attention enabled");
 #endif
 #endif
         LOG_INFO("loading model from '%s'", model_path.c_str());
-        ModelLoader model_loader;
 
         vae_tiling = vae_tiling_;
 
@@ -403,7 +404,7 @@ public:
             }
 
             size_t total_params_size = total_params_ram_size + total_params_vram_size;
-            LOG_INFO(
+            printf(
                 "total params memory size = %.2fMB (VRAM %.2fMB, RAM %.2fMB): "
                 "clip %.2fMB(%s), unet %.2fMB(%s), vae %.2fMB(%s), controlnet %.2fMB(%s), pmid %.2fMB(%s)",
                 total_params_size / 1024.0 / 1024.0,
@@ -475,6 +476,28 @@ public:
         LOG_DEBUG("finished loaded file");
         ggml_free(ctx);
         return true;
+    }
+
+    void load_diffusion_model() {
+        if (!diffusion_model || (diffusion_model->params_buffer == NULL)) {
+            int64_t t0 = ggml_time_ms();
+            printf("UNet model is unloaded; reloading\n");
+            diffusion_model = std::make_shared<UNetModel>(backend, model_data_type, version);
+            diffusion_model->alloc_params_buffer();
+            diffusion_model->get_param_tensors(tensors, "model.diffusion_model");
+            bool loaded_tensors = model_loader.load_tensors(tensors, backend, {}, {"model.diffusion_model"});
+            GGML_ASSERT(loaded_tensors);
+            int64_t t1 = ggml_time_ms();
+            printf("UNet model was loaded in %d ms\n", (int)(t1 - t0));
+        }
+    }
+
+    void unload_diffusion_model() {
+        if (diffusion_model && (diffusion_model->params_buffer != NULL)) {
+            printf("UNet model is unloading\n");
+            diffusion_model->free_params_buffer();
+            diffusion_model.reset();
+        }
     }
 
     bool is_using_v_parameterization_for_sd2(ggml_context* work_ctx) {
@@ -1050,7 +1073,12 @@ public:
                 auto on_tiling = [&](ggml_tensor* in, ggml_tensor* out, bool init) {
                     first_stage_model->compute(n_threads, in, decode, &out);
                 };
-                sd_tiling(x, result, 8, vae_tiling_size, vae_tiling_overlap, on_tiling);
+                if (result->ne[0] == result->ne[1]) {
+                    // sd_tiling4 only supports square images
+                    sd_tiling4(x, result, on_tiling);
+                } else {
+                    sd_tiling(x, result, 8, vae_tiling_size, 0.5f, on_tiling);
+                }
             } else {
                 first_stage_model->compute(n_threads, x, decode, &result);
             }
@@ -1328,8 +1356,11 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
     LOG_INFO("get_learned_condition completed, taking %" PRId64 " ms", t1 - t0);
 
     if (sd_ctx->sd->free_params_immediately) {
+        LOG_DEBUG("Freeing CLIP model");
         sd_ctx->sd->cond_stage_model->free_params_buffer();
     }
+
+    sd_ctx->sd->load_diffusion_model();
 
     // Control net hint
     struct ggml_tensor* image_hint = NULL;
@@ -1446,7 +1477,10 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
         int64_t time_start_all = ggml_time_ms();
         for (int b = 0; b < batch_count; b++) {
             // Sampling
+            sd_ctx->sd->load_diffusion_model();
             auto final_latent = run_samples(seed + b, b);
+            sd_ctx->sd->unload_diffusion_model();
+
             // Decoding
             t1                      = ggml_time_ms();
             struct ggml_tensor* img = sd_ctx->sd->decode_first_stage(work_ctx, final_latent);
