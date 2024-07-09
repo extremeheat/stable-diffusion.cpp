@@ -73,6 +73,7 @@ public:
     bool vae_decode_only         = false;
     bool free_params_immediately = false;
 
+    bool low_vram;
     ModelLoader model_loader;
 
     std::shared_ptr<RNG> rng = std::make_shared<STDDefaultRNG>();
@@ -96,6 +97,7 @@ public:
     bool stacked_id           = false;
 
     std::map<std::string, struct ggml_tensor*> tensors;
+    struct ggml_context* scheduler_ctx = NULL;
 
     std::string lora_model_dir;
     // lora_name => multiplier
@@ -165,9 +167,9 @@ public:
         }
 #ifdef SD_USE_FLASH_ATTENTION
 #if defined(SD_USE_CUBLAS) || defined(SD_USE_METAL)
-        printf("Flash Attention not supported with GPU Backend");
+        LOG_DEBUG("Flash Attention not supported with GPU Backend");
 #else
-        printf("Flash Attention enabled");
+        LOG_DEBUG("Flash Attention enabled");
 #endif
 #endif
         LOG_INFO("loading model from '%s'", model_path.c_str());
@@ -314,9 +316,11 @@ public:
         params.mem_buffer = NULL;
         params.no_alloc   = false;
         // LOG_DEBUG("mem_size %u ", params.mem_size);
-        struct ggml_context* ctx = ggml_init(params);  // for  alphas_cumprod and is_using_v_parameterization check
+        struct ggml_context* ctx = ggml_init(params);  // for is_using_v_parameterization check
         GGML_ASSERT(ctx != NULL);
-        ggml_tensor* alphas_cumprod_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, TIMESTEPS);
+
+        scheduler_ctx                      = ggml_init(params);  // for  alphas_cumprod and is_using_v_parameterization check
+        ggml_tensor* alphas_cumprod_tensor = ggml_new_tensor_1d(scheduler_ctx, GGML_TYPE_F32, TIMESTEPS);
         calculate_alphas_cumprod((float*)alphas_cumprod_tensor->data);
 
         // load weights
@@ -354,72 +358,15 @@ public:
             // first_stage_model->test();
             // return false;
         } else {
-            size_t clip_params_mem_size = cond_stage_model->get_params_buffer_size();
-            size_t unet_params_mem_size = diffusion_model->get_params_buffer_size();
-            size_t vae_params_mem_size  = 0;
-            if (!use_tiny_autoencoder) {
-                vae_params_mem_size = first_stage_model->get_params_buffer_size();
-            } else {
-                if (!tae_first_stage->load_from_file(taesd_path)) {
-                    return false;
-                }
-                vae_params_mem_size = tae_first_stage->get_params_buffer_size();
+            if (use_tiny_autoencoder && !tae_first_stage->load_from_file(taesd_path)) {
+                ggml_free(ctx);
+                return false;
             }
-            size_t control_net_params_mem_size = 0;
-            if (control_net) {
-                if (!control_net->load_from_file(control_net_path)) {
-                    return false;
-                }
-                control_net_params_mem_size = control_net->get_params_buffer_size();
+            if (control_net && !control_net->load_from_file(control_net_path)) {
+                ggml_free(ctx);
+                return false;
             }
-            size_t pmid_params_mem_size = 0;
-            if (stacked_id) {
-                pmid_params_mem_size = pmid_model->get_params_buffer_size();
-            }
-
-            size_t total_params_ram_size  = 0;
-            size_t total_params_vram_size = 0;
-            if (ggml_backend_is_cpu(clip_backend)) {
-                total_params_ram_size += clip_params_mem_size + pmid_params_mem_size;
-            } else {
-                total_params_vram_size += clip_params_mem_size + pmid_params_mem_size;
-            }
-
-            if (ggml_backend_is_cpu(backend)) {
-                total_params_ram_size += unet_params_mem_size;
-            } else {
-                total_params_vram_size += unet_params_mem_size;
-            }
-
-            if (ggml_backend_is_cpu(vae_backend)) {
-                total_params_ram_size += vae_params_mem_size;
-            } else {
-                total_params_vram_size += vae_params_mem_size;
-            }
-
-            if (ggml_backend_is_cpu(control_net_backend)) {
-                total_params_ram_size += control_net_params_mem_size;
-            } else {
-                total_params_vram_size += control_net_params_mem_size;
-            }
-
-            size_t total_params_size = total_params_ram_size + total_params_vram_size;
-            printf(
-                "total params memory size = %.2fMB (VRAM %.2fMB, RAM %.2fMB): "
-                "clip %.2fMB(%s), unet %.2fMB(%s), vae %.2fMB(%s), controlnet %.2fMB(%s), pmid %.2fMB(%s)",
-                total_params_size / 1024.0 / 1024.0,
-                total_params_vram_size / 1024.0 / 1024.0,
-                total_params_ram_size / 1024.0 / 1024.0,
-                clip_params_mem_size / 1024.0 / 1024.0,
-                ggml_backend_is_cpu(clip_backend) ? "RAM" : "VRAM",
-                unet_params_mem_size / 1024.0 / 1024.0,
-                ggml_backend_is_cpu(backend) ? "RAM" : "VRAM",
-                vae_params_mem_size / 1024.0 / 1024.0,
-                ggml_backend_is_cpu(vae_backend) ? "RAM" : "VRAM",
-                control_net_params_mem_size / 1024.0 / 1024.0,
-                ggml_backend_is_cpu(control_net_backend) ? "RAM" : "VRAM",
-                pmid_params_mem_size / 1024.0 / 1024.0,
-                ggml_backend_is_cpu(clip_backend) ? "RAM" : "VRAM");
+            log_memory_usage();
         }
 
         int64_t t1 = ggml_time_ms();
@@ -443,39 +390,143 @@ public:
             LOG_INFO("running in eps-prediction mode");
         }
 
-        if (schedule != DEFAULT) {
-            switch (schedule) {
-                case DISCRETE:
-                    LOG_INFO("running with discrete schedule");
-                    denoiser->schedule = std::make_shared<DiscreteSchedule>();
-                    break;
-                case KARRAS:
-                    LOG_INFO("running with Karras schedule");
-                    denoiser->schedule = std::make_shared<KarrasSchedule>();
-                    break;
-                case AYS:
-                    LOG_INFO("Running with Align-Your-Steps schedule");
-                    denoiser->schedule          = std::make_shared<AYSSchedule>();
-                    denoiser->schedule->version = version;
-                    break;
-                case DEFAULT:
-                    // Don't touch anything.
-                    break;
-                default:
-                    LOG_ERROR("Unknown schedule %i", schedule);
-                    abort();
-            }
-        }
-
-        for (int i = 0; i < TIMESTEPS; i++) {
-            denoiser->schedule->alphas_cumprod[i] = ((float*)alphas_cumprod_tensor->data)[i];
-            denoiser->schedule->sigmas[i]         = std::sqrt((1 - denoiser->schedule->alphas_cumprod[i]) / denoiser->schedule->alphas_cumprod[i]);
-            denoiser->schedule->log_sigmas[i]     = std::log(denoiser->schedule->sigmas[i]);
-        }
+        GGML_ASSERT(set_scheduler(schedule));
 
         LOG_DEBUG("finished loaded file");
         ggml_free(ctx);
         return true;
+    }
+
+    void log_memory_usage() {
+        size_t clip_params_mem_size = cond_stage_model->get_params_buffer_size();
+        size_t unet_params_mem_size = diffusion_model->get_params_buffer_size();
+        size_t vae_params_mem_size  = 0;
+        if (!use_tiny_autoencoder) {
+            vae_params_mem_size = first_stage_model->get_params_buffer_size();
+        } else {
+            vae_params_mem_size = tae_first_stage->get_params_buffer_size();
+        }
+        size_t control_net_params_mem_size = 0;
+        if (control_net) {
+            control_net_params_mem_size = control_net->get_params_buffer_size();
+        }
+        size_t pmid_params_mem_size = 0;
+        if (stacked_id) {
+            pmid_params_mem_size = pmid_model->get_params_buffer_size();
+        }
+
+        size_t total_params_ram_size  = 0;
+        size_t total_params_vram_size = 0;
+        if (ggml_backend_is_cpu(clip_backend)) {
+            total_params_ram_size += clip_params_mem_size + pmid_params_mem_size;
+        } else {
+            total_params_vram_size += clip_params_mem_size + pmid_params_mem_size;
+        }
+
+        if (ggml_backend_is_cpu(backend)) {
+            total_params_ram_size += unet_params_mem_size;
+        } else {
+            total_params_vram_size += unet_params_mem_size;
+        }
+
+        if (ggml_backend_is_cpu(vae_backend)) {
+            total_params_ram_size += vae_params_mem_size;
+        } else {
+            total_params_vram_size += vae_params_mem_size;
+        }
+
+        if (ggml_backend_is_cpu(control_net_backend)) {
+            total_params_ram_size += control_net_params_mem_size;
+        } else {
+            total_params_vram_size += control_net_params_mem_size;
+        }
+
+        size_t total_params_size = total_params_ram_size + total_params_vram_size;
+        printf(
+            "total params memory size = %.2fMB (VRAM %.2fMB, RAM %.2fMB): "
+            "clip %.2fMB(%s), unet %.2fMB(%s), vae %.2fMB(%s), controlnet %.2fMB(%s), pmid %.2fMB(%s)\n",
+            total_params_size / 1024.0 / 1024.0,
+            total_params_vram_size / 1024.0 / 1024.0,
+            total_params_ram_size / 1024.0 / 1024.0,
+            clip_params_mem_size / 1024.0 / 1024.0,
+            ggml_backend_is_cpu(clip_backend) ? "RAM" : "VRAM",
+            unet_params_mem_size / 1024.0 / 1024.0,
+            ggml_backend_is_cpu(backend) ? "RAM" : "VRAM",
+            vae_params_mem_size / 1024.0 / 1024.0,
+            ggml_backend_is_cpu(vae_backend) ? "RAM" : "VRAM",
+            control_net_params_mem_size / 1024.0 / 1024.0,
+            ggml_backend_is_cpu(control_net_backend) ? "RAM" : "VRAM",
+            pmid_params_mem_size / 1024.0 / 1024.0,
+            ggml_backend_is_cpu(clip_backend) ? "RAM" : "VRAM");
+    }
+
+    bool set_scheduler(schedule_t s) {
+        if (denoiser->scheduleType == s) {
+            // Already loaded. scheduleType starts as -1 so we always load alphas on first run.
+            return true;
+        }
+        switch (s) {
+            case DISCRETE:
+                printf("running with discrete schedule\n");
+                denoiser->schedule = std::make_shared<DiscreteSchedule>();
+                break;
+            case KARRAS:
+                printf("running with Karras schedule\n");
+                denoiser->schedule = std::make_shared<KarrasSchedule>();
+                break;
+            case AYS:
+                printf("Running with Align-Your-Steps schedule\n");
+                denoiser->schedule          = std::make_shared<AYSSchedule>();
+                denoiser->schedule->version = version;
+                break;
+            case DEFAULT:
+                // Don't touch anything.
+                break;
+            default:
+                LOG_ERROR("Unknown schedule %i", s);
+                return false;
+        }
+        denoiser->scheduleType = s;
+
+        for (int i = 0; i < TIMESTEPS; i++) {
+            denoiser->schedule->alphas_cumprod[i] = ((float*)tensors["alphas_cumprod"]->data)[i];
+            denoiser->schedule->sigmas[i]         = std::sqrt((1 - denoiser->schedule->alphas_cumprod[i]) / denoiser->schedule->alphas_cumprod[i]);
+            denoiser->schedule->log_sigmas[i]     = std::log(denoiser->schedule->sigmas[i]);
+        }
+        return true;
+    }
+
+    void load_clip_model() {
+        printf("Checking if CLIP model is loaded\n");
+        if (cond_stage_model->params_buffer == NULL) {
+            int64_t t0 = ggml_time_ms();
+            LOG_DEBUG("CLIP model is unloaded; reloading\n");
+            std::string embed_dir = cond_stage_model->embd_dir;
+            cond_stage_model = std::make_shared<FrozenCLIPEmbedderWithCustomWords>(clip_backend, model_data_type, version);
+            cond_stage_model->alloc_params_buffer();
+            cond_stage_model->get_param_tensors(tensors, "cond_stage_model.");
+            cond_stage_model->embd_dir = embed_dir;
+            bool loaded_tensors = model_loader.load_tensors(tensors, clip_backend, {}, {"cond_stage_model."});
+
+            LOG_DEBUG("loading vocab");
+            std::string merges_utf8_str = model_loader.load_merges();
+            if (merges_utf8_str.size() == 0) {
+                LOG_ERROR("get merges failed");
+                return;
+            }
+            cond_stage_model->tokenizer.load_from_merges(merges_utf8_str);
+
+            GGML_ASSERT(loaded_tensors);
+            int64_t t1 = ggml_time_ms();
+            LOG_DEBUG("CLIP model was loaded in %d ms\n", (int)(t1 - t0));
+        }
+    }
+
+    void unload_clip_model() {
+        if (cond_stage_model && (cond_stage_model->params_buffer != NULL)) {
+            printf("CLIP model is unloading\n");
+            cond_stage_model->free_params_buffer();
+        }
     }
 
     void load_diffusion_model() {
@@ -496,7 +547,6 @@ public:
         if (diffusion_model && (diffusion_model->params_buffer != NULL)) {
             printf("UNet model is unloading\n");
             diffusion_model->free_params_buffer();
-            diffusion_model.reset();
         }
     }
 
@@ -1184,6 +1234,10 @@ int sd_get_model_version(sd_ctx_t* sd_ctx) {
     return (int)sd_ctx->sd->version;
 }
 
+void sd_configure_scheduler(sd_ctx_t* sd_ctx, enum schedule_t s) {
+    sd_ctx->sd->set_scheduler(s);
+}
+
 void sd_configure_vae_tiling(sd_ctx_t* sd_ctx, bool enabled, int tiling_size, float tiling_overlap) {
     sd_ctx->sd->vae_tiling         = enabled;
     sd_ctx->sd->vae_tiling_size    = tiling_size;
@@ -1225,6 +1279,8 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
     }
 
     int sample_steps = sigmas.size() - 1;
+
+    sd_ctx->sd->load_clip_model();
 
     // Apply lora
     auto result_pair                                = extract_and_remove_lora(prompt);
@@ -1355,9 +1411,8 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
     t1 = ggml_time_ms();
     LOG_INFO("get_learned_condition completed, taking %" PRId64 " ms", t1 - t0);
 
-    if (sd_ctx->sd->free_params_immediately) {
-        LOG_DEBUG("Freeing CLIP model");
-        sd_ctx->sd->cond_stage_model->free_params_buffer();
+    if (sd_ctx->sd->free_params_immediately || sd_ctx->sd->low_vram) {
+        sd_ctx->sd->unload_clip_model();
     }
 
     sd_ctx->sd->load_diffusion_model();
@@ -1479,7 +1534,9 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
             // Sampling
             sd_ctx->sd->load_diffusion_model();
             auto final_latent = run_samples(seed + b, b);
-            sd_ctx->sd->unload_diffusion_model();
+            if (sd_ctx->sd->low_vram) {
+                sd_ctx->sd->unload_diffusion_model();
+            }
 
             // Decoding
             t1                      = ggml_time_ms();
@@ -1500,6 +1557,8 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx,
         int64_t time_end_all = ggml_time_ms();
         LOG_INFO("sampling and decoding completed for %d images, taking %.2fs", batch_count, (time_end_all - time_start_all) * 1.0f / 1000);
     }
+
+    sd_ctx->sd->log_memory_usage();
 
     ggml_free(work_ctx);
     return result_images;

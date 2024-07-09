@@ -237,6 +237,7 @@ struct KarrasSchedule : SigmaSchedule {
 
 struct Denoiser {
     std::shared_ptr<SigmaSchedule> schedule              = std::make_shared<DiscreteSchedule>();
+    int scheduleType                                     = -1;
     virtual std::vector<float> get_scalings(float sigma) = 0;
 };
 

@@ -44,6 +44,7 @@ typedef int socket_t;
 #define DEBUG_LOG(...)
 
 #define REPLACE(STR, FROM, TO) STR = std::regex_replace(STR, std::regex(FROM), TO);
+#define REPLACE_COPY(STR, FROM, TO) std::regex_replace(STR, std::regex(FROM), TO);
 
 std::string join(const std::vector<std::string>& v, const std::string& delim) {
     std::string s;
@@ -158,6 +159,26 @@ strength [denoising strength]
 ...
 */
 
+// Names of the sampler method, same order as enum sample_method in stable-diffusion.h
+const char* sample_method_str[] = {
+    "euler_a",
+    "euler",
+    "heun",
+    "dpm2",
+    "dpm++2s_a",
+    "dpm++2m",
+    "dpm++2mv2",
+    "lcm",
+};
+
+// Names of the sigma schedule overrides, same order as sample_schedule in stable-diffusion.h
+const char* schedule_str[] = {
+    "default",
+    "discrete",
+    "karras",
+    "ays",
+};
+
 struct ServerConfig {
     std::string mode;
     std::string model;
@@ -171,6 +192,7 @@ struct ServerConfig {
     int height;
     int width;
     sample_method_t sampling_method;
+    schedule_t scheduler;
     int clip_skip;
     int steps;
     int64_t seed;
@@ -180,6 +202,8 @@ struct ServerConfig {
     uint64_t jobId     = 0;
     uint64_t timeStart = 0;
     uint64_t timeEnd   = 0;
+    // When generating images in batch, this is the time the last entry ended so it can be used in place of timeStart
+    uint64_t timeLastEntryEnd = 0;
 
     std::vector<std::string> outResults;
 };
@@ -191,18 +215,23 @@ struct Result {
     bool wasRateLimited;
 };
 
-void server_dump_config(ServerConfig& config, std::ostream& to) {
+void server_dump_config(ServerConfig& config, std::ostream& to, bool skipImage = true) {
+    std::string prompt = REPLACE_COPY(config.prompt, "\n", "\\n");
+    std::string negative = REPLACE_COPY(config.negative_prompt, "\n", "\\n");
     to << "[SERVER] **" << config.mode << " request**" << std::endl;
+    to << "mode: " << config.mode << std::endl;
     to << "model: " << config.model << std::endl;
-    to << "prompt: " << config.prompt << std::endl;
-    to << "negative-prompt: " << config.negative_prompt << std::endl;
+    to << "prompt: " << prompt << std::endl;
+    to << "negative-prompt: " << negative << std::endl;
+    to << "image: " << (skipImage ? "(Image)" : config.image) << std::endl;
     to << "cfg-scale: " << config.cfg_scale << std::endl;
     to << "denoising-strength: " << config.denoising_strength << std::endl;
     to << "style-ratio: " << config.style_ratio << std::endl;
     to << "control-strength: " << config.control_strength << std::endl;
     to << "height: " << config.height << std::endl;
     to << "width: " << config.width << std::endl;
-    to << "sampling-method: " << config.sampling_method << std::endl;
+    to << "sampling-method: " << sample_method_str[config.sampling_method] << std::endl;
+    to << "scheduler: " << schedule_str[config.scheduler] << std::endl;
     to << "clip-skip: " << config.clip_skip << std::endl;
     to << "steps: " << config.steps << std::endl;
     to << "seed: " << config.seed << std::endl;
@@ -210,8 +239,10 @@ void server_dump_config(ServerConfig& config, std::ostream& to) {
     to << "auto-save: " << config.auto_save << std::endl;
 }
 
-void write_auto_saved_image_metadata(std::string filename, ServerConfig& config) {
+void write_auto_saved_image_metadata(std::string filename, ServerConfig& config, int timeStart, int timeEnd) {
     std::ofstream file(filename);
+    file << "time-start: " << config.timeStart << std::endl;
+    file << "time-end: " << config.timeEnd << std::endl;
     server_dump_config(config, file);
     file.close();
 }
@@ -269,6 +300,15 @@ Result parse_payload(std::string& payload, ServerConfig& config) {
             if (value == "LCM") config.sampling_method = LCM;
             // clang-format on
         }
+
+        if (key == "scheduler") {
+            // clang-format off
+            if (value == "DEFAULT") config.scheduler = schedule_t::DEFAULT;
+            if (value == "DISCRETE") config.scheduler = schedule_t::DISCRETE;
+            if (value == "KARRAS") config.scheduler = schedule_t::KARRAS;
+            if (value == "AYS") config.scheduler = schedule_t::AYS;
+            // clang-format on
+        }
     }
 
     // Ensure width and height are valid and multiples of 2
@@ -302,18 +342,6 @@ Result parse_img2img(std::string payload) {
 }
 
 #undef CHECK_REQ_ARG
-
-// clang-format off
-std::string http_build_response(std::string status, std::string payload, std::string contentType = "text/plain") {
-    return "HTTP/1.1 " + status + "\r\nContent-Type: " + contentType + "\r\nConnection: close\r\n\r\n" + payload;
-}
-std::string server_build_response_ok(std::string payload, std::string mimeType = "text/plain") {
-    return http_build_response("200 OK", payload, mimeType);
-}
-std::string server_build_response_error(std::string payload, std::string mimeType = "text/plain") {
-    return http_build_response("400 Bad Request", payload, mimeType);
-}
-// clang-format on
 
 struct ServerJob {
     uint64_t id;  // timestamp
@@ -454,8 +482,8 @@ void cleanup_old_jobs() {
             if (job.status == "PENDING") {
                 job.status = "ERROR";
                 job.result = "Job timed out";
-                std::cout << "[Server] Job " << id << " timed out" << std::endl;
             }
+            std::cout << "[Server] Job " << id << " timed out" << std::endl;
             oldJobs.push_back(id);
         }
     }
@@ -478,12 +506,15 @@ std::string raw_image_to_png_b64(int width, int height, unsigned char* data, int
     return base64_encode(std::string(png_data.begin(), png_data.end()));
 }
 
-void process_img_cb(void* ctx, int batchNo, int batchCount, sd_image_t* current_image) {
+void process_generated_image_cb(void* ctx, int batchNo, int batchCount, sd_image_t* current_image) {
     ServerConfig* params = (ServerConfig*)ctx;
+    uint64_t timeNow     = current_time_since_epoch_ms();
+    uint64_t timeStarted = params->timeLastEntryEnd || params->timeStart;
+    uint64_t timeElapsed = timeNow - timeStarted;
     std::string b64 =
         raw_image_to_png_b64(current_image->width, current_image->height,
                              current_image->data, current_image->channel);
-    b64 += " " + std::to_string(params->timeStart - current_time_since_epoch_ms());
+    b64 += " " + std::to_string(params->timeStart - timeNow);
     params->outResults.push_back(b64);
 
     if (params->auto_save) {
@@ -492,10 +523,11 @@ void process_img_cb(void* ctx, int batchNo, int batchCount, sd_image_t* current_
                        current_image->channel, current_image->data,
                        current_image->width * current_image->channel);
         std::string metaFile = output_dir + "output_" + std::to_string(params->timeStart) + "_" + std::to_string(batchNo) + ".txt";
-        write_auto_saved_image_metadata(metaFile, *params);
+        write_auto_saved_image_metadata(metaFile, *params, timeStarted, timeNow);
     }
     free(current_image->data);
     jobs[params->jobId].result = std::to_string(params->outResults.size()) + "\n" + join(params->outResults, "\n");
+    params->timeLastEntryEnd   = timeNow;
 }
 
 void process_progress_cb(int step, int steps, float time, const char* title, void* ctx) {
@@ -524,7 +556,9 @@ int run_sdci_txt2img(uint64_t jobId, ServerConfig params) {
     sd_image_t* control_image = NULL;
 
     sd_set_progress_callback(process_progress_cb, (void*)&params);
-    sd_set_batch_gen_progress_callback(process_img_cb, (void*)&params);
+    sd_set_batch_gen_progress_callback(process_generated_image_cb, (void*)&params);
+    printf("[Server] Using Scheduler: %d\n", params.scheduler);
+    sd_configure_scheduler(sd_ctx, params.scheduler);
 
     auto results =
         txt2img(sd_ctx, params.prompt.c_str(), params.negative_prompt.c_str(),
@@ -613,7 +647,7 @@ int run_sdci_img2img(uint64_t jobId, ServerConfig params) {
     input_image.data    = image_data;
 
     sd_set_progress_callback(process_progress_cb, (void*)&params);
-    sd_set_batch_gen_progress_callback(process_img_cb, (void*)&params);
+    sd_set_batch_gen_progress_callback(process_generated_image_cb, (void*)&params);
 
     auto results = img2img(
         sd_ctx, input_image, params.prompt.c_str(),
@@ -651,6 +685,20 @@ uint64_t server_queue_img2img(ServerConfig config) {
     return id;
 }
 
+#pragma region HTTP
+
+// clang-format off
+std::string http_build_response(std::string status, std::string payload, std::string contentType = "text/plain") {
+    return "HTTP/1.1 " + status + "\r\nContent-Type: " + contentType + "\r\nConnection: close\r\n\r\n" + payload;
+}
+std::string server_build_response_ok(std::string payload, std::string mimeType = "text/plain") {
+    return http_build_response("200 OK", payload, mimeType);
+}
+std::string server_build_response_error(std::string payload, std::string mimeType = "text/plain") {
+    return http_build_response("400 Bad Request", payload, mimeType);
+}
+// clang-format on
+
 std::string handle_text2img(std::string payload) {
     cleanup_old_jobs();
     Result result = parse_txt2img(payload);
@@ -661,7 +709,7 @@ std::string handle_text2img(std::string payload) {
         uint64_t jobId = server_queue_txt2img(result.config);
         return server_build_response_ok("OK\n" + std::to_string(jobId));
     } else {
-        return server_build_response_error("Error");
+        return server_build_response_error("ERROR\n" + result.message);
     }
 }
 
@@ -675,7 +723,7 @@ std::string handle_img2img(std::string payload) {
         uint64_t jobId = server_queue_img2img(result.config);
         return server_build_response_ok("OK\n" + std::to_string(jobId));
     } else {
-        return server_build_response_error("Error");
+        return server_build_response_error("ERROR\n" + result.message);
     }
 }
 
@@ -690,9 +738,8 @@ void handle_client(int client_socket) {
     setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv,
                sizeof tv);
 
-    // Read the request
+    // Read the request + Loop until we have received the entire request
     int bytes_received = 0;
-    // Loop until we have received the entire request
     while (true) {
         int bytes = recv(client_socket, buffer + bytes_received, BUFFER_SIZE - 1, 0);
         if (bytes <= 0)
@@ -729,6 +776,7 @@ void handle_client(int client_socket) {
             response = server_build_response_ok(html_bundle, "text/html");
         } else if (path == "/api/v0/models") {
             std::string models = "OK\n";
+            int count          = 0;
             for (auto& model : g_server_found_models) {
                 models += std::to_string(model.byteSize) + " " + model.fileName + "\n";
             }
@@ -748,8 +796,7 @@ void handle_client(int client_socket) {
             if (prepareResult.ok) {
                 response = server_build_response_ok("OK\n" + prepareResult.message);
             } else {
-                response = server_build_response_error("500 Internal Server Error\n" +
-                                                       prepareResult.message);
+                response = server_build_response_error("ERROR\n" + prepareResult.message);
             }
         } else if (path.starts_with("/api/v0/check/")) {
             std::string id_str = path.substr(14);
@@ -758,16 +805,16 @@ void handle_client(int client_socket) {
                 auto job = jobs[id];
                 response = server_build_response_ok(job.status + "\n" + job.result);
             } else {
-                response = server_build_response_error("404 Not Found");
+                response = http_build_response("404 Not Found", "Not Found");
             }
         } else {
-            response = server_build_response_error("404 Not Found");
+            response = http_build_response("404 Not Found", "Not Found");
         }
     } else if (method == "POST") {
         std::string body = request.substr(request.find("\r\n\r\n") + 4);
         if (body.empty()) {
             printf("[Server] No POST data received for request '%s'\n", path.c_str());
-            response = server_build_response_error("400 Bad Request");
+            response = server_build_response_error("ERROR\nNo POST data received");
         } else {
             // std::cout << "Received POST data: [" << body << "]" << std::endl;
             if (path == "/api/v0/txt2img") {
@@ -775,11 +822,11 @@ void handle_client(int client_socket) {
             } else if (path == "/api/v0/img2img") {
                 response = handle_img2img(body);
             } else {
-                response = server_build_response_error("404 Not Found");
+                response = http_build_response("404 Not Found", "Not Found");
             }
         }
     } else {
-        response = server_build_response_error("405 Method Not Allowed");
+        response = http_build_response("405 Method Not Allowed", "Method Not Allowed");
     }
 
     DEBUG_LOG("Sending response (" << response.length() << " bytes):\n----\n"
@@ -870,6 +917,8 @@ int server_start(int port, std::vector<std::string> files_dirs) {
     WSACleanup();
     return 0;
 }
+
+#pragma endregion
 
 void server_show_help() {
     std::cout << "Usage: server.exe [--port PORT]"

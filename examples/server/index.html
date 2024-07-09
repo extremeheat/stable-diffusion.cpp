@@ -197,7 +197,7 @@
         }
 
         /* turn bar into column if width is too small */
-        @media (max-width: 800px) {
+        @media (max-width: 900px) {
           .bar {
             gap: 16px;
             flex-direction: column;
@@ -274,7 +274,7 @@
         }
       }
 
-      @media (max-width: 800px) {
+      @media (max-width: 900px) {
         .content {
           width: 100%;
           margin: 0;
@@ -355,7 +355,7 @@
           align-self: center;
         }
 
-        @media (max-width: 800px) {
+        @media (max-width: 900px) {
           .group {
             flex-direction: column;
 
@@ -566,6 +566,12 @@
         ["DPMPP2Mv2", "DPM++ (2M) (New)"],
         ["LCM", "Latent Consistency Models"],
       ]
+      const schedulers = [
+        ["DEFAULT", "None"],
+        ["DISCRETE", "Discrete"],
+        ["KARRAS", "Karras"],
+        ["AYS", "Align-Your-Steps"],
+      ]
       const defaultWidth = 512
       const defaultHeight = 512
       const [width, setWidth] = useState(defaultWidth)
@@ -580,6 +586,7 @@
       const [showAdvanced, setShowAdvanced] = useState(false)
       const [autoSave, setAutoSave] = useState(true)
       const [samplingMethod, setSamplingMethod] = useState(samplingMethods[0][0])
+      const [scheduler, setScheduler] = useState(schedulers[0][0])
       const [upscaleRuns, setUpscaleRuns] = useState(0)
       const [controlStrength, setControlStrength] = useState(0.9)
       const [styleRatio, setStyleRatio] = useState(20)
@@ -601,6 +608,7 @@
         // showAdvanced,
         "auto-save": Number(autoSave),
         "sampling-method": samplingMethod,
+        scheduler,
         // upscaleRuns,
         "control-strength": controlStrength,
         "style-ratio": styleRatio,
@@ -764,13 +772,18 @@
                 options=${samplingMethods.map((e) => ({ label: e[1], value: e[0] }))}
                 value=${samplingMethod}
                 setValue=${setSamplingMethod} />
-              <${Slider}
-                label="Upscaler runs"
-                min="0"
-                max="32"
-                value=${upscaleRuns}
-                setValue=${setUpscaleRuns} />
+              <${Select}
+                label="Scheduler"
+                options=${schedulers.map((e) => ({ label: e[1], value: e[0] }))}
+                value=${scheduler}
+                setValue=${setScheduler} />
             </div>
+            <${Slider}
+              label="Upscaler runs"
+              min="0"
+              max="32"
+              value=${upscaleRuns}
+              setValue=${setUpscaleRuns} />
             <div class="group">
               <${Slider}
                 label="Style Ratio (%)"
@@ -836,6 +849,7 @@
                     alt=""
                     style="max-width: 100%; border: 1px solid #303030; border-radius: 4px;" />
                 </div>
+                <!--<div style="margin-bottom:10px;color:gray;font-size:small">Prompt • Negative • Seed: 10494843 • Euler • Karras • 2.3s</div>-->
                 <div class="buttons gap">
                   <button
                     class="btn-blue"
@@ -880,7 +894,7 @@
         <div style="display: flex; align-items: flex-end">
           <div>
             <div style="margin-bottom:6px;">
-              <span style="font-weight:bold; font-size: small;">Set Model</span>
+              <span style="font-weight:bold; font-size: small;">Generation Model</span>
             </div>
             <select name="model-selector" id="model-selector" onChange=${updateActiveModel}>
               <option disabled selected>Select model checkpoint</option>
@@ -1099,7 +1113,7 @@
 
     const API_HOST = window.API_HOST ?? "http://localhost:8024"
     const API_PATH = window.API_PATH ?? "/api/v0"
-    const FILES_DIR = (window.FILES_DIR ?? "C:/Users/Something/someDesktop/test").split("*")
+    const FILES_DIR = (window.FILES_DIR ?? "(unknown)").split("*")
     const OUTPUTS_DIR = window.OUTPUTS_DIR ?? FILES_DIR[0]
     const IS_MOCK = API_HOST.includes("localhost")
     const MODEL_VERSIONS = ["1", "2", "XL", "SVD"]
@@ -1124,7 +1138,7 @@
       if (url.includes("/api/v0/models")) {
         return Promise.resolve({
           ok: true,
-          text: () => Promise.resolve("39117 bundle.ggml\n22 someOther.safetensors"),
+          text: () => Promise.resolve("OK 2\n39117 bundle.ggml\n22 someModel.safetensors"),
         })
       } else if (url.includes("/api/v0/prepare/")) {
         console.log("Preparing model", url.split("/").pop())
@@ -1158,13 +1172,6 @@
           text: () => Promise.resolve("404"),
         })
       }
-    }
-
-    const generationTimes = []
-    window.averageGenerationTime = 0
-    function updateAverageGenerationTime() {
-      window.averageGenerationTime =
-        generationTimes.reduce((a, b) => a + b, 0) / generationTimes.length
     }
 
     let activeModel
@@ -1266,7 +1273,8 @@
 
       async function watchGenerationJob(id, data) {
         const start = Date.now()
-        for (let i = 0; i < STATUS_CHECK_MAX; i++) {
+        let i = 0
+        for (; i < STATUS_CHECK_MAX; i++) {
           const [code, generations] = await apiCall(`/check/${id}`)
 
           const images = []
@@ -1292,15 +1300,7 @@
           if (code === "SUCCESS") {
             const endTime = Date.now()
             const timeElapsed = endTime - start
-            generationTimes.push(timeElapsed)
-            updateAverageGenerationTime()
-            console.log(
-              "Generation completed in",
-              timeElapsed,
-              "ms",
-              generations,
-              averageGenerationTime
-            )
+            console.log("Generation completed in", timeElapsed, "ms", generations)
             setOutputStatus({ ok: true, images, message: "Generation completed successfully" })
             break
           } else if (code === "PENDING") {
@@ -1311,6 +1311,9 @@
             return // Stop checking
           }
           await sleep(1000)
+        }
+        if (i === STATUS_CHECK_MAX) {
+          setOutputStatus({ ok: false, message: 'Image generation timed out. The image might still be generating on the server.' })
         }
       }
 
