@@ -262,7 +262,160 @@ struct CompVisVDenoiser : public Denoiser {
     }
 };
 
+class BrownianTreeNoiseSampler {
+private:
+    ggml_tensor* x;
+    float sigma_min;
+    float sigma_max;
+    std::mt19937 gen;
+    std::function<float(float)> transform;
+    const float EPSILON = 1e-8f; // Small value to prevent zero standard deviation
+
+    // Simplified Brownian motion implementation using ggml
+    ggml_tensor* brownian_motion(ggml_context* ctx, float t0, float t1) {
+        int64_t nelements = ggml_nelements(x);
+        ggml_tensor* result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nelements);
+
+        // Ensure t1 > t0
+        if (t0 > t1) {
+            std::swap(t0, t1);
+        }
+
+        float time_diff = std::max(t1 - t0, EPSILON);
+        std::normal_distribution<float> dist(0.0f, std::sqrt(time_diff));
+        
+        float* data = (float*)result->data;
+        for (int64_t i = 0; i < nelements; ++i) {
+            data[i] = dist(gen);
+        }
+        return result;
+    }
+
+public:
+    BrownianTreeNoiseSampler(ggml_tensor* x, float sigma_min, float sigma_max,
+        unsigned int seed = std::random_device{}(),
+        std::function<float(float)> transform = [](float x) { return x; })
+        : x(x), sigma_min(sigma_min), sigma_max(sigma_max), gen(seed), transform(transform) {}
+
+    ggml_tensor* sample(ggml_context* ctx, float sigma, float sigma_next) {
+        printf("Sampling with sigma_min: %f, sigma_max: %f, sigma: %f, sigma_next: %f\n", sigma_min, sigma_max, sigma, sigma_next);
+        float t0 = transform(sigma);
+        float t1 = transform(sigma_next);
+        ggml_tensor* noise = brownian_motion(ctx, t0, t1);
+
+        // Ensure non-zero time difference for scaling
+        float time_diff = std::max(std::abs(t1 - t0), EPSILON);
+        float scale = 1.0f / std::sqrt(time_diff);
+
+        // Scale the noise
+        ggml_tensor* scaled_noise = ggml_scale(ctx, noise, scale);
+
+        // Fill scaled_noise with random values (for testing)
+        float* data = (float*)scaled_noise->data;
+        for (int64_t i = 0; i < ggml_nelements(scaled_noise); ++i) {
+            data[i] = (float)gen() / gen.max();
+        }
+
+        return scaled_noise;
+    }
+};
+
+float random_float() {
+    return (float)rand() / RAND_MAX;
+}
+
+
 typedef std::function<ggml_tensor*(ggml_tensor*, float, int)> denoise_cb_t;
+
+void sample_dpmpp_2m_sde(sample_method_t method,
+                         denoise_cb_t model,
+                         ggml_context* work_ctx,
+                         ggml_tensor* x,
+                         std::vector<float> sigmas,
+                         std::shared_ptr<RNG> rng,
+                         float eta = 1.0f,
+                         float s_noise = 1.0f,
+                         BrownianTreeNoiseSampler* noise_sampler = nullptr,
+                         const char* solver_type = "midpoint") {
+    size_t steps = sigmas.size() - 1;
+    float sigma_min = *std::min_element(sigmas.begin(), sigmas.end());
+    float sigma_max = *std::max_element(sigmas.begin(), sigmas.end());
+
+    if (noise_sampler == nullptr) {
+        noise_sampler = new BrownianTreeNoiseSampler(x, sigma_min, sigma_max);
+    }
+
+    if (strcmp(solver_type, "heun") != 0 && strcmp(solver_type, "midpoint") != 0) {
+        throw std::invalid_argument("solver_type must be 'heun' or 'midpoint'");
+    }
+
+    ggml_tensor* old_denoised = nullptr;
+    float h_last = 0.0f;
+
+    for (int i = 0; i < steps; i++) {
+        ggml_tensor* denoised = model(x, sigmas[i], i + 1);
+
+        float t = -std::log(sigmas[i]);
+        float s = -std::log(sigmas[i + 1]);
+        float h = s - t;
+        float eta_h = eta * h;
+
+        if (sigmas[i + 1] == 0) {
+            // Denoising step
+            ggml_cpy(work_ctx, denoised, x);
+        } else {
+            // DPM-Solver++(2M) SDE
+            float* vec_x = (float*)x->data;
+            float* vec_denoised = (float*)denoised->data;
+
+            for (int j = 0; j < ggml_nelements(x); j++) {
+                vec_x[j] = (sigmas[i + 1] / sigmas[i]) * std::exp(-eta_h) * vec_x[j] +
+                           (1.0f - std::exp(-h - eta_h)) * vec_denoised[j];
+            }
+
+            if (old_denoised != nullptr) {
+                float r = h_last / h;
+                float* vec_old_denoised = (float*)old_denoised->data;
+
+                if (strcmp(solver_type, "heun") == 0) {
+                    for (int j = 0; j < ggml_nelements(x); j++) {
+                        vec_x[j] += ((1.0f - std::exp(-h - eta_h)) / (h + eta_h) + 1.0f) * (1.0f / r) *
+                                    (vec_denoised[j] - vec_old_denoised[j]);
+                    }
+                } else if (strcmp(solver_type, "midpoint") == 0) {
+                    for (int j = 0; j < ggml_nelements(x); j++) {
+                        vec_x[j] += 0.5f * (1.0f - std::exp(-h - eta_h)) * (1.0f / r) *
+                                    (vec_denoised[j] - vec_old_denoised[j]);
+                    }
+                }
+            }
+
+            if (eta > 0) {
+                ggml_tensor* noise = noise_sampler->sample(work_ctx, sigmas[i], sigmas[i + 1]);
+                float* vec_noise = (float*)noise->data;
+                printf("Noise: %f %f %f\n", vec_noise[0], vec_noise[1], vec_noise[2]);
+                float scale = sigmas[i + 1] * std::sqrt(1.0f - std::exp(-2 * eta_h)) * s_noise;
+                printf("Scale: %f\n", scale);
+
+                for (int j = 0; j < ggml_nelements(x); j++) {
+                    vec_x[j] = scale * vec_noise[j];
+                    // vec_x[j] = vec_noise[j];
+                }
+            }
+        }
+
+        if (old_denoised == nullptr) {
+            old_denoised = ggml_dup_tensor(work_ctx, denoised);
+        } else {
+            ggml_cpy(work_ctx, denoised, old_denoised);
+        }
+        h_last = h;
+    }
+
+    if (noise_sampler != nullptr) {
+        delete noise_sampler;
+    }
+}
 
 // k diffusion reverse ODE: dx = (x - D(x;\sigma)) / \sigma dt; \sigma(t) = t
 static void sample_k_diffusion(sample_method_t method,
@@ -329,6 +482,7 @@ static void sample_k_diffusion(sample_method_t method,
         } break;
         case EULER:  // Implemented without any sigma churn
         {
+            // printf("Denoising with Euler method\n");
             struct ggml_tensor* d = ggml_dup_tensor(work_ctx, x);
 
             for (int i = 0; i < steps; i++) {
@@ -616,6 +770,9 @@ static void sample_k_diffusion(sample_method_t method,
                     vec_old_denoised[j] = vec_denoised[j];
                 }
             }
+        } break;
+        case DPMPP2M_SDE: {
+            sample_dpmpp_2m_sde(method, model, work_ctx, x, sigmas, rng);
         } break;
         case LCM:  // Latent Consistency Models
         {

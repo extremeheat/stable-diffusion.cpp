@@ -502,11 +502,11 @@ public:
             int64_t t0 = ggml_time_ms();
             LOG_DEBUG("CLIP model is unloaded; reloading\n");
             std::string embed_dir = cond_stage_model->embd_dir;
-            cond_stage_model = std::make_shared<FrozenCLIPEmbedderWithCustomWords>(clip_backend, model_data_type, version);
+            cond_stage_model      = std::make_shared<FrozenCLIPEmbedderWithCustomWords>(clip_backend, model_data_type, version);
             cond_stage_model->alloc_params_buffer();
             cond_stage_model->get_param_tensors(tensors, "cond_stage_model.");
             cond_stage_model->embd_dir = embed_dir;
-            bool loaded_tensors = model_loader.load_tensors(tensors, clip_backend, {}, {"cond_stage_model."});
+            bool loaded_tensors        = model_loader.load_tensors(tensors, clip_backend, {}, {"cond_stage_model."});
 
             LOG_DEBUG("loading vocab");
             std::string merges_utf8_str = model_loader.load_merges();

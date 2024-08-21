@@ -316,6 +316,8 @@ struct ControlNet : public GGMLModule {
     struct ggml_tensor* guided_hint = NULL;     // guided_hint cache, for faster inference
     bool guided_hint_cached         = false;
 
+    std::string lastModelPath;
+
     ControlNet(ggml_backend_t backend,
                ggml_type wtype,
                SDVersion version = VERSION_1_x)
@@ -431,6 +433,7 @@ struct ControlNet : public GGMLModule {
     }
 
     bool load_from_file(const std::string& file_path) {
+        lastModelPath = file_path;
         LOG_INFO("loading control net from '%s'", file_path.c_str());
         alloc_params_buffer();
         std::map<std::string, ggml_tensor*> tensors;
@@ -452,6 +455,14 @@ struct ControlNet : public GGMLModule {
 
         LOG_INFO("control net model loaded");
         return success;
+    }
+
+    bool reload_from_last_file_if_unloaded() {
+        if (params_ctx != NULL)
+            return true;  // already loaded
+        if (lastModelPath.empty())
+            return false;
+        return load_from_file(lastModelPath);
     }
 };
 

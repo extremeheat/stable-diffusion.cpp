@@ -297,6 +297,7 @@ Result parse_payload(std::string& payload, ServerConfig& config) {
             if (value == "DPMPP2S_A") config.sampling_method = DPMPP2S_A;
             if (value == "DPMPP2M") config.sampling_method = DPMPP2M;
             if (value == "DPMPP2Mv2") config.sampling_method = DPMPP2Mv2;
+            if (value == "DPMPP2M_SDE") config.sampling_method = DPMPP2M_SDE;
             if (value == "LCM") config.sampling_method = LCM;
             // clang-format on
         }

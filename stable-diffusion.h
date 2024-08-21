@@ -42,6 +42,7 @@ enum sample_method_t {
     DPMPP2M,
     DPMPP2Mv2,
     LCM,
+    DPMPP2M_SDE,
     N_SAMPLE_METHODS
 };
 
